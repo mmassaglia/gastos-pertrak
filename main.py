@@ -366,7 +366,7 @@ async def process_update(update: dict):
     # ── /misgastos ──
     if text == "/misgastos":
         conn = get_db()
-        mes  = date.today().strftime("%Y-%m")
+        mes  = (date.today().replace(day=1)).strftime("%Y-%m")
         rows = conn.execute(
             "SELECT fecha,categoria,monto,moneda,descripcion FROM gastos WHERE empleado_id=? AND substr(fecha,1,7)=? ORDER BY fecha DESC",
             (emp["id"], mes)
