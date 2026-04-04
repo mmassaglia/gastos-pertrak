@@ -621,14 +621,15 @@ async def process_update(update: dict):
         return
 
     if state.get("step") == "categoria_ticket":
-        if text not in CATEGORIAS:
+        cat_match = next((c for c in CATEGORIAS if c.lower() == text.lower() or c in text or text in c), None)
+        if not cat_match:
             await send_msg(chat_id, "⚠️ Elegí una categoría.", make_keyboard(CATEGORIAS, 2))
             return
         d = state["data"]
         conn = get_db()
         conn.execute(
             "INSERT INTO gastos (empleado_id,fecha,monto,moneda,categoria,metodo_pago,descripcion) VALUES (?,?,?,?,?,?,?)",
-            (d["empleado_id"], d["fecha"], d["monto"], d["moneda"], text, d.get("metodo_pago","Efectivo"), d.get("descripcion"))
+            (d["empleado_id"], d["fecha"], d["monto"], d["moneda"], cat_match, d.get("metodo_pago","Efectivo"), d.get("descripcion"))
         )
         conn.commit()
         conn.close()
@@ -659,19 +660,22 @@ async def process_update(update: dict):
         return
 
     if state.get("step") == "categoria":
-        if text not in CATEGORIAS:
-            await send_msg(chat_id, "⚠️ Elegí una categoría.", make_keyboard(CATEGORIAS, 2))
+        # Buscar coincidencia flexible (ignora mayúsculas/tildes parciales)
+        cat_match = next((c for c in CATEGORIAS if c.lower() == text.lower() or c in text or text in c), None)
+        if not cat_match:
+            await send_msg(chat_id, "⚠️ Elegí una categoría de la lista.", make_keyboard(CATEGORIAS, 2))
             return
-        d = state["data"]; d["categoria"] = text
+        d = state["data"]; d["categoria"] = cat_match
         set_state(chat_id, "metodo_pago", d)
         await send_msg(chat_id, "💳 <b>Paso 3/6</b> — Método de pago:", make_keyboard(METODOS_PAGO, 2))
         return
 
     if state.get("step") == "metodo_pago":
-        if text not in METODOS_PAGO:
+        mp_match = next((m for m in METODOS_PAGO if m.lower() == text.lower() or m in text or text in m), None)
+        if not mp_match:
             await send_msg(chat_id, "⚠️ Elegí un método de pago.", make_keyboard(METODOS_PAGO, 2))
             return
-        d = state["data"]; d["metodo_pago"] = text
+        d = state["data"]; d["metodo_pago"] = mp_match
         set_state(chat_id, "moneda", d)
         await send_msg(chat_id, "💱 <b>Paso 4/6</b> — Moneda:", make_keyboard(["ARS 🇦🇷", "USD 🇺🇸"], 2))
         return
