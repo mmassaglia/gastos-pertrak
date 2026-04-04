@@ -1,12 +1,11 @@
-from fastapi import FastAPI, HTTPException, Query
+rom fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 from datetime import date, datetime
-import sqlite3, io, csv, os, httpx, asyncio, base64
+import sqlite3, io, csv, os, httpx, asyncio, base64, json
 
-app = FastAPI(title="Sistema de Gastos - Pertrak", version="2.0.0")
+app = FastAPI(title="Sistema de Gastos - Pertrak", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,10 +14,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_PATH      = "gastos.db"
-BOT_TOKEN    = "8632601955:AAH3u0UXOcSRh8mLgfxdaGwNviIfQOAsASo"
+DB_PATH       = "gastos.db"
+BOT_TOKEN     = "8632601955:AAH3u0UXOcSRh8mLgfxdaGwNviIfQOAsASo"
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY", "")
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TELEGRAM_API  = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 CATEGORIAS = [
     "Refrigerio", "Viáticos", "Transporte", "Combustible",
@@ -57,11 +56,43 @@ def init_db():
             estado       TEXT DEFAULT 'pendiente',
             created_at   TEXT DEFAULT (datetime('now','localtime'))
         );
+        CREATE TABLE IF NOT EXISTS bot_states (
+            chat_id     TEXT PRIMARY KEY,
+            step        TEXT,
+            data        TEXT,
+            updated_at  TEXT DEFAULT (datetime('now','localtime'))
+        );
     """)
     conn.commit()
     conn.close()
 
 init_db()
+
+# ─────────────────────────────────────────
+# Estado del bot en DB (persiste entre reinicios)
+# ─────────────────────────────────────────
+def get_state(chat_id: str) -> dict:
+    conn = get_db()
+    row = conn.execute("SELECT step, data FROM bot_states WHERE chat_id=?", (chat_id,)).fetchone()
+    conn.close()
+    if not row or not row["step"]:
+        return {}
+    return {"step": row["step"], "data": json.loads(row["data"] or "{}")}
+
+def set_state(chat_id: str, step: str, data: dict):
+    conn = get_db()
+    conn.execute(
+        "INSERT OR REPLACE INTO bot_states (chat_id, step, data, updated_at) VALUES (?,?,?,datetime('now','localtime'))",
+        (chat_id, step, json.dumps(data))
+    )
+    conn.commit()
+    conn.close()
+
+def clear_state(chat_id: str):
+    conn = get_db()
+    conn.execute("DELETE FROM bot_states WHERE chat_id=?", (chat_id,))
+    conn.commit()
+    conn.close()
 
 # ─────────────────────────────────────────
 # Schemas
@@ -243,11 +274,9 @@ def get_categorias():
     return CATEGORIAS
 
 # ─────────────────────────────────────────
-# CLAUDE VISION — leer ticket desde imagen
+# CLAUDE VISION
 # ─────────────────────────────────────────
 async def analizar_ticket(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
-    """Envía la imagen a Claude y extrae monto, fecha, descripción y moneda."""
-    # Limitar tamaño a 1MB máximo
     if len(image_bytes) > 1_000_000:
         image_bytes = image_bytes[:1_000_000]
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
@@ -268,7 +297,7 @@ async def analizar_ticket(image_bytes: bytes, mime_type: str = "image/jpeg") -> 
                         "{\n"
                         '  "monto": <número con decimales, solo el total final>,\n'
                         '  "moneda": <"ARS" o "USD">,\n'
-                        '  "fecha": <"YYYY-MM-DD" o null si no se ve>,\n'
+                        '  "fecha": <"YYYY-MM-DD" — usá el año actual 2026 si el ticket no muestra el año claramente>,\n'
                         '  "descripcion": <descripción breve del comercio o producto, máximo 60 caracteres>\n'
                         "}\n"
                         "Si no podés leer algún campo, ponelo como null. Respondé SOLO el JSON."
@@ -291,13 +320,11 @@ async def analizar_ticket(image_bytes: bytes, mime_type: str = "image/jpeg") -> 
             raise Exception(f"API error {r.status_code}: {r.text}")
         text = r.json()["content"][0]["text"].strip()
         text = text.replace("```json","").replace("```","").strip()
-        import json
         return json.loads(text)
+
 # ─────────────────────────────────────────
 # TELEGRAM BOT
 # ─────────────────────────────────────────
-user_state = {}
-
 async def send_msg(chat_id, text, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if reply_markup:
@@ -314,13 +341,11 @@ def make_keyboard(options, columns=2):
 def remove_keyboard():
     return {"remove_keyboard": True}
 
-async def get_file_bytes(file_id: str) -> tuple[bytes, str]:
-    """Descarga un archivo de Telegram y devuelve sus bytes y mime_type."""
+async def get_file_bytes(file_id: str) -> tuple:
     async with httpx.AsyncClient() as client:
         r = await client.get(f"{TELEGRAM_API}/getFile?file_id={file_id}")
         file_path = r.json()["result"]["file_path"]
-        ext = file_path.split(".")[-1].lower()
-        mime = "image/jpeg" if ext in ("jpg","jpeg") else "image/png" if ext == "png" else "image/jpeg"
+        mime = "image/png" if file_path.endswith(".png") else "image/jpeg"
         file_r = await client.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}")
         return file_r.content, mime
 
@@ -347,11 +372,12 @@ async def process_update(update: dict):
     emp = dict(emp)
     conn.close()
 
-    state = user_state.get(chat_id, {})
+    # Leer estado desde DB
+    state = get_state(chat_id)
 
     # ── /start o /ayuda ──
     if text in ("/start", "/ayuda", "/help"):
-        user_state[chat_id] = {}
+        clear_state(chat_id)
         await send_msg(chat_id,
             f"👋 Hola <b>{emp['nombre']}</b>!\n\n"
             "Soy el bot de gastos de <b>Pertrak</b>. Podés:\n\n"
@@ -366,18 +392,17 @@ async def process_update(update: dict):
     # ── /misgastos ──
     if text == "/misgastos":
         conn = get_db()
-        mes  = (date.today().replace(day=1)).strftime("%Y-%m")
         rows = conn.execute(
-            "SELECT fecha,categoria,monto,moneda,descripcion FROM gastos WHERE empleado_id=? AND substr(fecha,1,7)=? ORDER BY fecha DESC",
-            (emp["id"], mes)
+            "SELECT fecha,categoria,monto,moneda,descripcion FROM gastos WHERE empleado_id=? ORDER BY fecha DESC LIMIT 20",
+            (emp["id"],)
         ).fetchall()
         conn.close()
         if not rows:
-            await send_msg(chat_id, "📭 No tenés gastos registrados este mes.")
+            await send_msg(chat_id, "📭 No tenés gastos registrados todavía.")
         else:
             total_ars = sum(r["monto"] for r in rows if r["moneda"]=="ARS")
             total_usd = sum(r["monto"] for r in rows if r["moneda"]=="USD")
-            lines = [f"📋 <b>Tus gastos de {mes}:</b>\n"]
+            lines = [f"📋 <b>Tus últimos gastos:</b>\n"]
             for r in rows:
                 lines.append(f"• {r['fecha']} | {r['categoria']} | <b>{r['moneda']} ${r['monto']:,.2f}</b>{' — '+r['descripcion'] if r['descripcion'] else ''}")
             lines.append(f"\n💰 <b>Total ARS: ${total_ars:,.2f}</b>")
@@ -406,17 +431,14 @@ async def process_update(update: dict):
                 )
                 return
 
-            # Guardar datos extraídos y pedir solo la categoría
-            user_state[chat_id] = {
-                "step": "categoria_ticket",
-                "data": {
-                    "empleado_id": emp["id"],
-                    "fecha": fecha,
-                    "monto": monto,
-                    "moneda": moneda,
-                    "descripcion": descripcion
-                }
-            }
+            # Guardar estado en DB
+            set_state(chat_id, "categoria_ticket", {
+                "empleado_id": emp["id"],
+                "fecha": fecha,
+                "monto": monto,
+                "moneda": moneda,
+                "descripcion": descripcion
+            })
 
             await send_msg(chat_id,
                 f"✅ <b>Ticket leído correctamente:</b>\n\n"
@@ -447,7 +469,7 @@ async def process_update(update: dict):
         )
         conn.commit()
         conn.close()
-        user_state[chat_id] = {}
+        clear_state(chat_id)
         await send_msg(chat_id,
             f"🎉 <b>Gasto registrado desde ticket:</b>\n\n"
             f"📅 {d['fecha']} | 🗂 {d['categoria']}\n"
@@ -460,7 +482,7 @@ async def process_update(update: dict):
 
     # ── /nuevo — flujo manual ──
     if text == "/nuevo":
-        user_state[chat_id] = {"step": "fecha", "data": {"empleado_id": emp["id"]}}
+        set_state(chat_id, "fecha", {"empleado_id": emp["id"]})
         await send_msg(chat_id,
             "📅 <b>Paso 1/5</b> — ¿Cuál es la fecha del gasto?\n"
             "Escribí la fecha en formato <b>YYYY-MM-DD</b> o enviá <b>hoy</b>.",
@@ -475,8 +497,9 @@ async def process_update(update: dict):
         except:
             await send_msg(chat_id, "⚠️ Formato incorrecto. Usá YYYY-MM-DD o escribí <b>hoy</b>.")
             return
-        user_state[chat_id]["data"]["fecha"] = fecha
-        user_state[chat_id]["step"] = "categoria"
+        d = state["data"]
+        d["fecha"] = fecha
+        set_state(chat_id, "categoria", d)
         await send_msg(chat_id, "🗂 <b>Paso 2/5</b> — ¿Cuál es la categoría?", make_keyboard(CATEGORIAS, 2))
         return
 
@@ -484,8 +507,9 @@ async def process_update(update: dict):
         if text not in CATEGORIAS:
             await send_msg(chat_id, "⚠️ Elegí una categoría de la lista.", make_keyboard(CATEGORIAS, 2))
             return
-        user_state[chat_id]["data"]["categoria"] = text
-        user_state[chat_id]["step"] = "moneda"
+        d = state["data"]
+        d["categoria"] = text
+        set_state(chat_id, "moneda", d)
         await send_msg(chat_id, "💱 <b>Paso 3/5</b> — ¿En qué moneda?", make_keyboard(["ARS 🇦🇷", "USD 🇺🇸"], 2))
         return
 
@@ -494,8 +518,9 @@ async def process_update(update: dict):
         if not moneda:
             await send_msg(chat_id, "⚠️ Elegí ARS o USD.", make_keyboard(["ARS 🇦🇷", "USD 🇺🇸"], 2))
             return
-        user_state[chat_id]["data"]["moneda"] = moneda
-        user_state[chat_id]["step"] = "monto"
+        d = state["data"]
+        d["moneda"] = moneda
+        set_state(chat_id, "monto", d)
         await send_msg(chat_id, f"💰 <b>Paso 4/5</b> — ¿Cuánto fue el monto en {moneda}?", remove_keyboard())
         return
 
@@ -505,15 +530,15 @@ async def process_update(update: dict):
         except:
             await send_msg(chat_id, "⚠️ Ingresá solo el número, ej: <b>1500.50</b>")
             return
-        user_state[chat_id]["data"]["monto"] = monto
-        user_state[chat_id]["step"] = "descripcion"
+        d = state["data"]
+        d["monto"] = monto
+        set_state(chat_id, "descripcion", d)
         await send_msg(chat_id, "📝 <b>Paso 5/5</b> — Descripción breve (o <b>-</b> para omitir):", remove_keyboard())
         return
 
     if state.get("step") == "descripcion":
         desc = None if text == "-" else text
-        d = user_state[chat_id]["data"]
-        d["descripcion"] = desc
+        d = state["data"]
         conn = get_db()
         conn.execute(
             "INSERT INTO gastos (empleado_id,fecha,monto,moneda,categoria,descripcion) VALUES (?,?,?,?,?,?)",
@@ -521,7 +546,7 @@ async def process_update(update: dict):
         )
         conn.commit()
         conn.close()
-        user_state[chat_id] = {}
+        clear_state(chat_id)
         await send_msg(chat_id,
             f"✅ <b>Gasto registrado:</b>\n\n"
             f"📅 {d['fecha']} | 🗂 {d['categoria']}\n"
