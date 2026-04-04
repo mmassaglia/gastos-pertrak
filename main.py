@@ -249,7 +249,7 @@ async def analizar_ticket(image_bytes: bytes, mime_type: str = "image/jpeg") -> 
     """Envía la imagen a Claude y extrae monto, fecha, descripción y moneda."""
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
     payload = {
-        "model": "claude-opus-4-5",
+       "model": "claude-haiku-4-5-20251001",
         "max_tokens": 512,
         "messages": [{
             "role": "user",
