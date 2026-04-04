@@ -17,7 +17,7 @@ app.add_middleware(
 
 DB_PATH      = "gastos.db"
 BOT_TOKEN    = "8632601955:AAH3u0UXOcSRh8mLgfxdaGwNviIfQOAsASo"
-ANTHROPIC_KEY = "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"
+AANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 CATEGORIAS = [
