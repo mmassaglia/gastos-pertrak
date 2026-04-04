@@ -247,6 +247,9 @@ def get_categorias():
 # ─────────────────────────────────────────
 async def analizar_ticket(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
     """Envía la imagen a Claude y extrae monto, fecha, descripción y moneda."""
+    # Limitar tamaño a 1MB máximo
+    if len(image_bytes) > 1_000_000:
+        image_bytes = image_bytes[:1_000_000]
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
     payload = {
         "model": "claude-sonnet-4-5-20250929",
@@ -256,7 +259,7 @@ async def analizar_ticket(image_bytes: bytes, mime_type: str = "image/jpeg") -> 
             "content": [
                 {
                     "type": "image",
-                    "source": {"type": "base64", "media_type": mime_type, "data": image_b64}
+                    "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}
                 },
                 {
                     "type": "text",
@@ -284,13 +287,12 @@ async def analizar_ticket(image_bytes: bytes, mime_type: str = "image/jpeg") -> 
             },
             json=payload
         )
-        r.raise_for_status()
+        if not r.is_success:
+            raise Exception(f"API error {r.status_code}: {r.text}")
         text = r.json()["content"][0]["text"].strip()
-        # limpiar posibles backticks
         text = text.replace("```json","").replace("```","").strip()
         import json
         return json.loads(text)
-
 # ─────────────────────────────────────────
 # TELEGRAM BOT
 # ─────────────────────────────────────────
