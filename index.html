@@ -296,8 +296,13 @@ function TabGastos({empleados, user}){
     setError('');
     const p = new URLSearchParams();
     Object.entries(filtros).forEach(([k,v])=>{ if(v) p.set(k,v); });
-    try{ const r=await fetch(`${API}/gastos?${p}`,{headers:authHeaders()}); setGastos(await r.json()); }
-    catch(e){ setError('Error al cargar gastos: '+e.message); setGastos([]); }
+    try{
+      const r = await fetch(`${API}/gastos?${p}`,{headers:authHeaders()});
+      const data = await r.json();
+      if(!r.ok) throw new Error(data.detail || data.error || `Error ${r.status}`);
+      if(!Array.isArray(data)) throw new Error('Respuesta inválida del servidor');
+      setGastos(data);
+    }catch(e){ setError('Error al cargar gastos: '+e.message); setGastos([]); }
     finally{ setLoading(false); }
   }
 
@@ -407,7 +412,9 @@ function TabReportes({user}){
   async function cargar(){
     const p = new URLSearchParams({desde,hasta});
     const r = await fetch(`${API}/resumen?${p}`,{headers:authHeaders()});
-    setData(await r.json());
+    const data = await r.json();
+    if(!r.ok) throw new Error(data.detail || data.error || `Error ${r.status}`);
+    setData(data);
   }
 
   useEffect(()=>{ cargar(); },[desde,hasta]);
@@ -470,7 +477,12 @@ function TabUsuarios(){
   function showToast(m){ setToast(m); setTimeout(()=>setToast(''),2800); }
   const set = k => e => setForm(f=>({...f,[k]:e.target.value}));
 
-  async function cargar(){ const r=await fetch(`${API}/usuarios`,{headers:authHeaders()}); setUsuarios(await r.json()); }
+  async function cargar(){
+    const r = await fetch(`${API}/usuarios`,{headers:authHeaders()});
+    const data = await r.json();
+    if(!r.ok) throw new Error(data.detail || data.error || `Error ${r.status}`);
+    setUsuarios(data);
+  }
   useEffect(()=>{ cargar(); },[]);
 
   async function crear(){
