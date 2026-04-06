@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query, Depends
+rom fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -625,22 +625,30 @@ async def process_update(update: dict):
         if not cat_match:
             await send_msg(chat_id, "⚠️ Elegí una categoría.", make_keyboard(CATEGORIAS, 2))
             return
-        d = state["data"]
-        conn = get_db()
-        conn.execute(
-            "INSERT INTO gastos (empleado_id,fecha,monto,moneda,categoria,metodo_pago,descripcion) VALUES (?,?,?,?,?,?,?)",
-            (d["empleado_id"], d["fecha"], d["monto"], d["moneda"], cat_match, d.get("metodo_pago","Efectivo"), d.get("descripcion"))
-        )
-        conn.commit()
-        conn.close()
-        clear_state(chat_id)
-        await send_msg(chat_id,
-            f"🎉 <b>Gasto registrado:</b>\n"
-            f"📅 {d['fecha']} | 🗂 {text}\n"
-            f"💰 {d['moneda']} ${d['monto']:,.2f} | 💳 {d.get('metodo_pago','Efectivo')}\n"
-            f"📝 {d.get('descripcion') or '—'}\n\n¿Tenés otro ticket?",
-            make_keyboard(["/nuevo", "/misgastos"])
-        )
+        try:
+            d = state["data"]
+            monto = float(d["monto"])
+            conn = get_db()
+            conn.execute(
+                "INSERT INTO gastos (empleado_id,fecha,monto,moneda,categoria,metodo_pago,descripcion) VALUES (?,?,?,?,?,?,?)",
+                (d["empleado_id"], d["fecha"], monto, d["moneda"], cat_match, d.get("metodo_pago","Efectivo"), d.get("descripcion"))
+            )
+            conn.commit()
+            conn.close()
+            clear_state(chat_id)
+            await send_msg(chat_id,
+                f"🎉 <b>Gasto registrado:</b>\n"
+                f"📅 {d['fecha']} | 🗂 {cat_match}\n"
+                f"💰 {d['moneda']} ${monto:,.2f} | 💳 {d.get('metodo_pago','Efectivo')}\n"
+                f"📝 {d.get('descripcion') or '—'}\n\n¿Tenés otro ticket?",
+                make_keyboard(["/nuevo", "/misgastos"])
+            )
+        except Exception as ex:
+            clear_state(chat_id)
+            await send_msg(chat_id,
+                f"⚠️ Error al registrar: {str(ex)}\nUsá /nuevo para intentar de nuevo.",
+                make_keyboard(["/nuevo", "/misgastos"])
+            )
         return
 
     if text == "/nuevo":
