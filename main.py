@@ -482,7 +482,7 @@ async def analizar_ticket(image_bytes: bytes, mime_type: str = "image/jpeg") -> 
                     "{\n"
                     '  "monto": <número con decimales, solo el total final>,\n'
                     '  "moneda": <"ARS" o "USD">,\n'
-                    '  "fecha": <"YYYY-MM-DD" — usá el año 2026 si no se ve claramente>,\n'
+                    '  "fecha": <"YYYY-MM-DD" — la fecha de emisión del ticket/comprobante, NO la fecha de inicio de actividades del comercio — usá el año 2026 si no se ve claramente>,\n'
                     '  "descripcion": <descripción breve del comercio, máximo 60 caracteres>,\n'
                     '  "metodo_pago": <"Efectivo", "Tarjeta de crédito", "Tarjeta de débito", "Transferencia" o "Otros">\n'
                     "}\n"
