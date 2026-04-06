@@ -1,580 +1,774 @@
-<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Gastos Pertrak</title>
-  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Syne:wght@700;800&display=swap" rel="stylesheet"/>
-  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-  <style>
-    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-    :root{
-      --bg:#0F1117;--surface:#1A1D27;--surface2:#22263A;--ink:#F0F2FF;
-      --ink-soft:#8B90B0;--accent:#6C63FF;--accent2:#FF6B6B;--green:#4ECDC4;
-      --gold:#FFD93D;--border:#2A2D40;--radius:12px;--shadow:0 4px 24px rgba(0,0,0,.4);
+from fastapi import FastAPI, HTTPException, Query, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
+from typing import Optional
+from datetime import date, datetime
+import sqlite3, io, csv, os, httpx, asyncio, base64, json, hashlib, secrets
+
+app = FastAPI(title="Sistema de Gastos - Pertrak", version="4.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+DB_PATH       = "gastos.db"
+BOT_TOKEN     = "8632601955:AAH3u0UXOcSRh8mLgfxdaGwNviIfQOAsASo"
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY", "")
+TELEGRAM_API  = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+CATEGORIAS = [
+    "Refrigerio", "Viáticos", "Transporte", "Combustible",
+    "Alojamiento", "Papelería", "Herramientas", "Telefonía",
+    "Representación", "Otros"
+]
+
+METODOS_PAGO = [
+    "Efectivo", "Tarjeta de crédito", "Tarjeta de débito",
+    "Transferencia", "Otros"
+]
+
+security = HTTPBearer(auto_error=False)
+
+# ─────────────────────────────────────────
+# Base de datos
+# ─────────────────────────────────────────
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def init_db():
+    conn = get_db()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS usuarios (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            username   TEXT UNIQUE NOT NULL,
+            password   TEXT NOT NULL,
+            nombre     TEXT NOT NULL,
+            rol        TEXT DEFAULT 'empleado',
+            activo     INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT (datetime('now','localtime'))
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            token      TEXT PRIMARY KEY,
+            usuario_id INTEGER REFERENCES usuarios(id),
+            created_at TEXT DEFAULT (datetime('now','localtime'))
+        );
+        CREATE TABLE IF NOT EXISTS empleados (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id TEXT UNIQUE,
+            nombre      TEXT NOT NULL,
+            email       TEXT,
+            activo      INTEGER DEFAULT 1,
+            created_at  TEXT DEFAULT (datetime('now','localtime'))
+        );
+        CREATE TABLE IF NOT EXISTS gastos (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            empleado_id   INTEGER REFERENCES empleados(id),
+            usuario_id    INTEGER REFERENCES usuarios(id),
+            fecha         TEXT NOT NULL,
+            monto         REAL NOT NULL,
+            moneda        TEXT DEFAULT 'ARS',
+            categoria     TEXT NOT NULL,
+            metodo_pago   TEXT DEFAULT 'Efectivo',
+            descripcion   TEXT,
+            nro_tarjeta   TEXT,
+            estado        TEXT DEFAULT 'pendiente',
+            created_at    TEXT DEFAULT (datetime('now','localtime'))
+        );
+        CREATE TABLE IF NOT EXISTS bot_states (
+            chat_id    TEXT PRIMARY KEY,
+            step       TEXT,
+            data       TEXT,
+            updated_at TEXT DEFAULT (datetime('now','localtime'))
+        );
+    """)
+    # Crear usuario admin por defecto si no existe
+    admin = conn.execute("SELECT id FROM usuarios WHERE username='admin'").fetchone()
+    if not admin:
+        conn.execute(
+            "INSERT INTO usuarios (username,password,nombre,rol) VALUES (?,?,?,?)",
+            ("admin", hash_password("admin123"), "Administrador", "admin")
+        )
+        conn.commit()
+    conn.close()
+
+init_db()
+
+# ─────────────────────────────────────────
+# Auth
+# ─────────────────────────────────────────
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if not credentials:
+        raise HTTPException(401, "No autenticado")
+    token = credentials.credentials
+    conn = get_db()
+    row = conn.execute(
+        "SELECT u.* FROM sessions s JOIN usuarios u ON s.usuario_id=u.id WHERE s.token=? AND u.activo=1",
+        (token,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(401, "Token inválido o expirado")
+    return dict(row)
+
+def require_admin(user=Depends(get_current_user)):
+    if user["rol"] != "admin":
+        raise HTTPException(403, "Se requiere rol administrador")
+    return user
+
+# ─────────────────────────────────────────
+# Estado del bot en DB
+# ─────────────────────────────────────────
+def get_state(chat_id: str) -> dict:
+    conn = get_db()
+    row = conn.execute("SELECT step, data FROM bot_states WHERE chat_id=?", (chat_id,)).fetchone()
+    conn.close()
+    if not row or not row["step"]:
+        return {}
+    return {"step": row["step"], "data": json.loads(row["data"] or "{}")}
+
+def set_state(chat_id: str, step: str, data: dict):
+    conn = get_db()
+    conn.execute(
+        "INSERT OR REPLACE INTO bot_states (chat_id,step,data,updated_at) VALUES (?,?,?,datetime('now','localtime'))",
+        (chat_id, step, json.dumps(data))
+    )
+    conn.commit()
+    conn.close()
+
+def clear_state(chat_id: str):
+    conn = get_db()
+    conn.execute("DELETE FROM bot_states WHERE chat_id=?", (chat_id,))
+    conn.commit()
+    conn.close()
+
+# ─────────────────────────────────────────
+# Schemas
+# ─────────────────────────────────────────
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class UsuarioCreate(BaseModel):
+    username: str
+    password: str
+    nombre: str
+    rol: str = "empleado"
+
+class UsuarioUpdate(BaseModel):
+    nombre: Optional[str] = None
+    password: Optional[str] = None
+    rol: Optional[str] = None
+    activo: Optional[int] = None
+
+class EmpleadoCreate(BaseModel):
+    telegram_id: Optional[str] = None
+    nombre: str
+    email: Optional[str] = None
+
+class GastoCreate(BaseModel):
+    empleado_id: Optional[int] = None
+    fecha: str
+    monto: float
+    moneda: str = "ARS"
+    categoria: str
+    metodo_pago: str = "Efectivo"
+    descripcion: Optional[str] = None
+    nro_tarjeta: Optional[str] = None
+
+class GastoUpdate(BaseModel):
+    fecha: Optional[str] = None
+    monto: Optional[float] = None
+    moneda: Optional[str] = None
+    categoria: Optional[str] = None
+    metodo_pago: Optional[str] = None
+    descripcion: Optional[str] = None
+    estado: Optional[str] = None
+
+# ─────────────────────────────────────────
+# AUTH ENDPOINTS
+# ─────────────────────────────────────────
+@app.post("/auth/login", tags=["Auth"])
+def login(req: LoginRequest):
+    conn = get_db()
+    user = conn.execute(
+        "SELECT * FROM usuarios WHERE username=? AND password=? AND activo=1",
+        (req.username, hash_password(req.password))
+    ).fetchone()
+    if not user:
+        conn.close()
+        raise HTTPException(401, "Usuario o contraseña incorrectos")
+    token = secrets.token_hex(32)
+    conn.execute("INSERT INTO sessions (token, usuario_id) VALUES (?,?)", (token, user["id"]))
+    conn.commit()
+    conn.close()
+    return {"token": token, "nombre": user["nombre"], "rol": user["rol"], "username": user["username"]}
+
+@app.post("/auth/logout", tags=["Auth"])
+def logout(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if credentials:
+        conn = get_db()
+        conn.execute("DELETE FROM sessions WHERE token=?", (credentials.credentials,))
+        conn.commit()
+        conn.close()
+    return {"mensaje": "Sesión cerrada"}
+
+@app.get("/auth/me", tags=["Auth"])
+def me(user=Depends(get_current_user)):
+    return {"id": user["id"], "username": user["username"], "nombre": user["nombre"], "rol": user["rol"]}
+
+# ─────────────────────────────────────────
+# USUARIOS (solo admin)
+# ─────────────────────────────────────────
+@app.post("/usuarios", tags=["Usuarios"])
+def crear_usuario(u: UsuarioCreate, admin=Depends(require_admin)):
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO usuarios (username,password,nombre,rol) VALUES (?,?,?,?)",
+            (u.username, hash_password(u.password), u.nombre, u.rol)
+        )
+        conn.commit()
+        row = conn.execute("SELECT id,username,nombre,rol,activo FROM usuarios WHERE username=?", (u.username,)).fetchone()
+        return dict(row)
+    except sqlite3.IntegrityError:
+        raise HTTPException(400, f"El usuario '{u.username}' ya existe")
+    finally:
+        conn.close()
+
+@app.get("/usuarios", tags=["Usuarios"])
+def listar_usuarios(admin=Depends(require_admin)):
+    conn = get_db()
+    rows = conn.execute("SELECT id,username,nombre,rol,activo,created_at FROM usuarios ORDER BY nombre").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+@app.put("/usuarios/{uid}", tags=["Usuarios"])
+def actualizar_usuario(uid: int, u: UsuarioUpdate, admin=Depends(require_admin)):
+    conn = get_db()
+    data = u.dict(exclude_none=True)
+    if "password" in data:
+        data["password"] = hash_password(data["password"])
+    if data:
+        sets = ", ".join(f"{k}=?" for k in data)
+        conn.execute(f"UPDATE usuarios SET {sets} WHERE id=?", list(data.values())+[uid])
+        conn.commit()
+    row = conn.execute("SELECT id,username,nombre,rol,activo FROM usuarios WHERE id=?", (uid,)).fetchone()
+    conn.close()
+    return dict(row)
+
+@app.delete("/usuarios/{uid}", tags=["Usuarios"])
+def eliminar_usuario(uid: int, admin=Depends(require_admin)):
+    conn = get_db()
+    conn.execute("UPDATE usuarios SET activo=0 WHERE id=?", (uid,))
+    conn.commit()
+    conn.close()
+    return {"mensaje": "Usuario desactivado"}
+
+# ─────────────────────────────────────────
+# EMPLEADOS
+# ─────────────────────────────────────────
+@app.post("/empleados", tags=["Empleados"])
+def crear_empleado(e: EmpleadoCreate, user=Depends(get_current_user)):
+    conn = get_db()
+    try:
+        conn.execute("INSERT INTO empleados (telegram_id,nombre,email) VALUES (?,?,?)",
+                     (e.telegram_id, e.nombre, e.email))
+        conn.commit()
+        row = conn.execute("SELECT * FROM empleados WHERE nombre=? ORDER BY id DESC LIMIT 1", (e.nombre,)).fetchone()
+        return dict(row)
+    except sqlite3.IntegrityError:
+        raise HTTPException(400, "Ya existe un empleado con ese Telegram ID")
+    finally:
+        conn.close()
+
+@app.get("/empleados", tags=["Empleados"])
+def listar_empleados(user=Depends(get_current_user)):
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM empleados WHERE activo=1 ORDER BY nombre").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+@app.delete("/empleados/{eid}", tags=["Empleados"])
+def eliminar_empleado(eid: int, admin=Depends(require_admin)):
+    conn = get_db()
+    conn.execute("UPDATE empleados SET activo=0 WHERE id=?", (eid,))
+    conn.commit()
+    conn.close()
+    return {"mensaje": "Empleado desactivado"}
+
+# ─────────────────────────────────────────
+# GASTOS
+# ─────────────────────────────────────────
+@app.post("/gastos", tags=["Gastos"])
+def crear_gasto(g: GastoCreate, user=Depends(get_current_user)):
+    if g.categoria not in CATEGORIAS:
+        raise HTTPException(400, "Categoría inválida.")
+    if g.metodo_pago not in METODOS_PAGO:
+        raise HTTPException(400, "Método de pago inválido.")
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO gastos (empleado_id,usuario_id,fecha,monto,moneda,categoria,metodo_pago,descripcion,nro_tarjeta) VALUES (?,?,?,?,?,?,?,?,?)",
+        (g.empleado_id, user["id"], g.fecha, g.monto, g.moneda, g.categoria, g.metodo_pago, g.descripcion, g.nro_tarjeta)
+    )
+    conn.commit()
+    row = conn.execute(
+        """SELECT g.*, 
+           COALESCE(e.nombre, u.nombre) AS empleado 
+           FROM gastos g 
+           LEFT JOIN empleados e ON g.empleado_id=e.id 
+           LEFT JOIN usuarios u ON g.usuario_id=u.id
+           ORDER BY g.id DESC LIMIT 1"""
+    ).fetchone()
+    conn.close()
+    return dict(row)
+
+@app.get("/gastos", tags=["Gastos"])
+def listar_gastos(
+    empleado_id: Optional[int] = None,
+    desde: Optional[str] = None,
+    hasta: Optional[str] = None,
+    categoria: Optional[str] = None,
+    metodo_pago: Optional[str] = None,
+    moneda: Optional[str] = None,
+    estado: Optional[str] = None,
+    user=Depends(get_current_user)
+):
+    conn = get_db()
+    sql = """SELECT g.*, COALESCE(e.nombre, u.nombre) AS empleado
+             FROM gastos g
+             LEFT JOIN empleados e ON g.empleado_id=e.id
+             LEFT JOIN usuarios u ON g.usuario_id=u.id
+             WHERE 1=1"""
+    params = []
+    # Empleados solo ven sus propios gastos
+    if user["rol"] == "empleado":
+        sql += " AND g.usuario_id=?"; params.append(user["id"])
+    if empleado_id: sql += " AND g.empleado_id=?"; params.append(empleado_id)
+    if desde:       sql += " AND g.fecha>=?";       params.append(desde)
+    if hasta:       sql += " AND g.fecha<=?";       params.append(hasta)
+    if categoria:   sql += " AND g.categoria=?";    params.append(categoria)
+    if metodo_pago: sql += " AND g.metodo_pago=?";  params.append(metodo_pago)
+    if moneda:      sql += " AND g.moneda=?";       params.append(moneda)
+    if estado:      sql += " AND g.estado=?";       params.append(estado)
+    sql += " ORDER BY g.fecha DESC, g.id DESC"
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+@app.put("/gastos/{gid}", tags=["Gastos"])
+def actualizar_gasto(gid: int, g: GastoUpdate, user=Depends(get_current_user)):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM gastos WHERE id=?", (gid,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(404, "Gasto no encontrado")
+    # Empleados solo pueden editar sus propios gastos pendientes
+    if user["rol"] == "empleado":
+        if row["usuario_id"] != user["id"]:
+            conn.close()
+            raise HTTPException(403, "No podés editar gastos de otros")
+        if row["estado"] != "pendiente":
+            conn.close()
+            raise HTTPException(403, "Solo podés editar gastos pendientes")
+    data = g.dict(exclude_none=True)
+    if data:
+        sets = ", ".join(f"{k}=?" for k in data)
+        conn.execute(f"UPDATE gastos SET {sets} WHERE id=?", list(data.values())+[gid])
+        conn.commit()
+    row = conn.execute(
+        "SELECT g.*, COALESCE(e.nombre,u.nombre) AS empleado FROM gastos g LEFT JOIN empleados e ON g.empleado_id=e.id LEFT JOIN usuarios u ON g.usuario_id=u.id WHERE g.id=?",
+        (gid,)
+    ).fetchone()
+    conn.close()
+    return dict(row)
+
+@app.delete("/gastos/{gid}", tags=["Gastos"])
+def eliminar_gasto(gid: int, admin=Depends(require_admin)):
+    conn = get_db()
+    conn.execute("DELETE FROM gastos WHERE id=?", (gid,))
+    conn.commit()
+    conn.close()
+    return {"mensaje": "Gasto eliminado"}
+
+# ─────────────────────────────────────────
+# REPORTES
+# ─────────────────────────────────────────
+@app.get("/resumen", tags=["Reportes"])
+def resumen(desde: Optional[str] = None, hasta: Optional[str] = None, user=Depends(get_current_user)):
+    conn = get_db()
+    params = []
+    where = "WHERE 1=1"
+    if user["rol"] == "empleado":
+        where += " AND usuario_id=?"; params.append(user["id"])
+    if desde: where += " AND fecha>=?"; params.append(desde)
+    if hasta: where += " AND fecha<=?"; params.append(hasta)
+    total_ars = conn.execute(f"SELECT COALESCE(SUM(monto),0) FROM gastos {where} AND moneda='ARS'", params).fetchone()[0]
+    total_usd = conn.execute(f"SELECT COALESCE(SUM(monto),0) FROM gastos {where} AND moneda='USD'", params).fetchone()[0]
+    por_cat   = conn.execute(f"SELECT categoria,moneda,SUM(monto) as total,COUNT(*) as qty FROM gastos {where} GROUP BY categoria,moneda ORDER BY total DESC", params).fetchall()
+    por_metodo = conn.execute(f"SELECT metodo_pago,SUM(monto) as total,COUNT(*) as qty FROM gastos {where} AND moneda='ARS' GROUP BY metodo_pago ORDER BY total DESC", params).fetchall()
+    por_emp   = conn.execute(f"SELECT COALESCE(e.nombre,u.nombre) as nombre,g.moneda,SUM(g.monto) as total,COUNT(*) as qty FROM gastos g LEFT JOIN empleados e ON g.empleado_id=e.id LEFT JOIN usuarios u ON g.usuario_id=u.id {where.replace('WHERE','WHERE g.')} GROUP BY nombre,g.moneda ORDER BY total DESC", params).fetchall()
+    por_mes   = conn.execute(f"SELECT substr(fecha,1,7) as mes,moneda,SUM(monto) as total FROM gastos {where} GROUP BY mes,moneda ORDER BY mes DESC", params).fetchall()
+    conn.close()
+    return {
+        "total_ars": round(total_ars, 2),
+        "total_usd": round(total_usd, 2),
+        "por_categoria": [dict(r) for r in por_cat],
+        "por_metodo_pago": [dict(r) for r in por_metodo],
+        "por_empleado":  [dict(r) for r in por_emp],
+        "por_mes":       [dict(r) for r in por_mes],
     }
-    body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--ink);min-height:100vh;}
 
-    /* LOGIN */
-    .login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1rem;
-      background:radial-gradient(ellipse at 60% 40%,rgba(108,99,255,.15) 0%,transparent 60%);}
-    .login-box{background:var(--surface);border:1px solid var(--border);border-radius:20px;
-      padding:2.5rem;width:100%;max-width:400px;box-shadow:0 20px 60px rgba(0,0,0,.5);}
-    .login-logo{font-family:'Syne',sans-serif;font-size:1.6rem;font-weight:800;text-align:center;margin-bottom:.5rem;}
-    .login-logo span{color:var(--accent);}
-    .login-sub{text-align:center;color:var(--ink-soft);font-size:.85rem;margin-bottom:2rem;}
-    .login-field{display:flex;flex-direction:column;gap:.35rem;margin-bottom:1rem;}
-    .login-field label{font-size:.75rem;font-weight:600;color:var(--ink-soft);text-transform:uppercase;letter-spacing:.05em;}
-    .login-field input{background:var(--surface2);border:1.5px solid var(--border);border-radius:8px;
-      padding:.65rem .85rem;font-family:'Space Grotesk',sans-serif;font-size:.95rem;color:var(--ink);}
-    .login-field input:focus{outline:none;border-color:var(--accent);}
-    .login-err{background:rgba(255,107,107,.1);border:1px solid var(--accent2);border-radius:8px;
-      padding:.6rem .85rem;font-size:.82rem;color:var(--accent2);margin-bottom:1rem;}
-    .btn-login{width:100%;background:var(--accent);color:#fff;border:none;border-radius:10px;
-      padding:.75rem;font-family:'Syne',sans-serif;font-size:1rem;font-weight:700;cursor:pointer;
-      transition:background .17s;margin-top:.5rem;}
-    .btn-login:hover{background:#5a52d5;}
-    .login-hint{text-align:center;font-size:.75rem;color:var(--ink-soft);margin-top:1rem;}
+@app.get("/exportar/excel", tags=["Reportes"])
+def exportar_excel(desde: Optional[str] = None, hasta: Optional[str] = None, user=Depends(get_current_user)):
+    conn = get_db()
+    sql = """SELECT g.fecha, COALESCE(e.nombre,u.nombre) as empleado, g.categoria, g.metodo_pago,
+             g.descripcion, g.monto, g.moneda, g.estado, g.created_at
+             FROM gastos g LEFT JOIN empleados e ON g.empleado_id=e.id LEFT JOIN usuarios u ON g.usuario_id=u.id
+             WHERE 1=1"""
+    params = []
+    if user["rol"] == "empleado":
+        sql += " AND g.usuario_id=?"; params.append(user["id"])
+    if desde: sql += " AND g.fecha>=?"; params.append(desde)
+    if hasta: sql += " AND g.fecha<=?"; params.append(hasta)
+    sql += " ORDER BY g.fecha DESC"
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Fecha","Empleado","Categoría","Método de Pago","Descripción","Monto","Moneda","Estado","Registrado"])
+    for r in rows:
+        writer.writerow(list(r))
+    output.seek(0)
+    return StreamingResponse(
+        io.BytesIO(output.getvalue().encode('utf-8-sig')),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=gastos_{date.today()}.csv"}
+    )
 
-    /* HEADER */
-    header{background:var(--surface);border-bottom:1px solid var(--border);padding:0 2rem;
-      display:flex;align-items:center;justify-content:space-between;height:64px;position:sticky;top:0;z-index:100;}
-    .logo{font-family:'Syne',sans-serif;font-size:1.3rem;font-weight:800;}
-    .logo span{color:var(--accent);}
-    .header-right{display:flex;align-items:center;gap:1rem;}
-    .user-chip{background:var(--surface2);border:1px solid var(--border);border-radius:20px;
-      padding:.3rem .85rem;font-size:.8rem;display:flex;align-items:center;gap:.4rem;}
-    .role-badge{font-size:.65rem;font-weight:700;padding:.15rem .45rem;border-radius:10px;text-transform:uppercase;}
-    .role-admin{background:rgba(108,99,255,.2);color:var(--accent);}
-    .role-empleado{background:rgba(78,205,196,.2);color:var(--green);}
-    .nav-tabs{display:flex;gap:.25rem;}
-    .nav-tab{background:transparent;border:none;color:var(--ink-soft);font-family:'Space Grotesk',sans-serif;
-      font-size:.85rem;font-weight:500;padding:.45rem 1rem;border-radius:8px;cursor:pointer;transition:all .18s;}
-    .nav-tab:hover{background:var(--surface2);color:var(--ink);}
-    .nav-tab.active{background:var(--accent);color:#fff;}
+@app.get("/categorias", tags=["Config"])
+def get_categorias():
+    return CATEGORIAS
 
-    /* LAYOUT */
-    .container{max-width:1100px;margin:0 auto;padding:2rem 1.5rem;}
-    .page-title{font-family:'Syne',sans-serif;font-size:1.8rem;font-weight:800;margin-bottom:1.5rem;}
-    .page-title small{font-family:'Space Grotesk',sans-serif;font-size:.85rem;color:var(--ink-soft);font-weight:400;display:block;margin-top:.2rem;}
-    .top-bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;flex-wrap:wrap;gap:.75rem;}
+@app.get("/metodos-pago", tags=["Config"])
+def get_metodos_pago():
+    return METODOS_PAGO
 
-    /* STATS */
-    .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin-bottom:2rem;}
-    .stat{background:var(--surface);border-radius:var(--radius);padding:1.25rem;border:1px solid var(--border);}
-    .stat-val{font-family:'Syne',sans-serif;font-size:1.6rem;font-weight:800;margin-bottom:.25rem;}
-    .stat-val.green{color:var(--green);}.stat-val.gold{color:var(--gold);}
-    .stat-val.purple{color:var(--accent);}.stat-val.red{color:var(--accent2);}
-    .stat-lbl{font-size:.75rem;color:var(--ink-soft);text-transform:uppercase;letter-spacing:.06em;font-weight:600;}
-
-    /* FILTERS */
-    .filters{display:flex;gap:.75rem;flex-wrap:wrap;margin-bottom:1.25rem;align-items:center;}
-    .filters input,.filters select{background:var(--surface);border:1px solid var(--border);border-radius:8px;
-      padding:.45rem .85rem;color:var(--ink);font-family:'Space Grotesk',sans-serif;font-size:.85rem;}
-    .filters input:focus,.filters select:focus{outline:none;border-color:var(--accent);}
-
-    /* TABLE */
-    .table-wrap{background:var(--surface);border-radius:var(--radius);border:1px solid var(--border);overflow:hidden;}
-    table{width:100%;border-collapse:collapse;}
-    thead th{background:var(--surface2);padding:.75rem 1rem;text-align:left;font-size:.75rem;
-      text-transform:uppercase;letter-spacing:.06em;color:var(--ink-soft);font-weight:600;}
-    tbody tr{border-top:1px solid var(--border);transition:background .12s;}
-    tbody tr:hover{background:var(--surface2);}
-    tbody td{padding:.75rem 1rem;font-size:.85rem;}
-    .badge{font-size:.7rem;font-weight:700;padding:.2rem .6rem;border-radius:20px;text-transform:uppercase;letter-spacing:.04em;}
-    .badge-ars{background:rgba(78,205,196,.15);color:var(--green);}
-    .badge-usd{background:rgba(255,217,61,.15);color:var(--gold);}
-    .badge-pendiente{background:rgba(108,99,255,.15);color:var(--accent);}
-    .badge-aprobado{background:rgba(78,205,196,.15);color:var(--green);}
-    .badge-rechazado{background:rgba(255,107,107,.15);color:var(--accent2);}
-    .badge-mp{background:rgba(255,255,255,.08);color:var(--ink-soft);}
-
-    /* BTNS */
-    .btn{display:inline-flex;align-items:center;gap:.4rem;padding:.5rem 1.1rem;border-radius:9px;border:none;
-      font-family:'Space Grotesk',sans-serif;font-size:.85rem;font-weight:600;cursor:pointer;transition:all .17s;}
-    .btn-primary{background:var(--accent);color:#fff;}.btn-primary:hover{background:#5a52d5;}
-    .btn-ghost{background:transparent;border:1px solid var(--border);color:var(--ink);}
-    .btn-ghost:hover{border-color:var(--accent);color:var(--accent);}
-    .btn-green{background:var(--green);color:#000;}
-    .btn-export{background:var(--gold);color:#000;}.btn-export:hover{opacity:.85;}
-    .btn-sm{padding:.3rem .65rem;font-size:.75rem;}
-    .btn-red{color:var(--accent2)!important;}
-
-    /* MODAL */
-    .overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);backdrop-filter:blur(4px);z-index:200;
-      display:flex;align-items:center;justify-content:center;padding:1rem;}
-    .modal{background:var(--surface);border-radius:18px;padding:2rem;width:100%;max-width:500px;
-      border:1px solid var(--border);animation:popIn .2s ease;max-height:90vh;overflow-y:auto;}
-    @keyframes popIn{from{transform:scale(.94);opacity:0}to{transform:scale(1);opacity:1}}
-    .modal h2{font-family:'Syne',sans-serif;font-size:1.4rem;margin-bottom:1.25rem;}
-    .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:.75rem;}
-    .form-grid .full{grid-column:1/-1;}
-    .field{display:flex;flex-direction:column;gap:.3rem;}
-    .field label{font-size:.75rem;font-weight:600;color:var(--ink-soft);text-transform:uppercase;letter-spacing:.05em;}
-    .field input,.field select,.field textarea{background:var(--surface2);border:1px solid var(--border);
-      border-radius:8px;padding:.55rem .75rem;font-family:'Space Grotesk',sans-serif;font-size:.9rem;color:var(--ink);}
-    .field input:focus,.field select:focus{outline:none;border-color:var(--accent);}
-    .modal-footer{display:flex;gap:.75rem;justify-content:flex-end;margin-top:1.5rem;}
-
-    /* REPORTES */
-    .report-grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem;}
-    .report-card{background:var(--surface);border-radius:var(--radius);padding:1.25rem;border:1px solid var(--border);}
-    .report-card h3{font-size:.85rem;color:var(--ink-soft);text-transform:uppercase;letter-spacing:.06em;font-weight:600;margin-bottom:1rem;}
-    .report-row{display:flex;justify-content:space-between;align-items:center;padding:.4rem 0;border-bottom:1px solid var(--border);font-size:.85rem;}
-    .report-row:last-child{border:none;}
-    .report-row strong{color:var(--green);font-weight:700;}
-
-    /* USUARIOS */
-    .usr-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:1rem;}
-    .usr-card{background:var(--surface);border-radius:var(--radius);padding:1.25rem;border:1px solid var(--border);}
-    .usr-avatar{width:42px;height:42px;border-radius:50%;background:var(--accent);display:flex;align-items:center;
-      justify-content:center;font-family:'Syne',sans-serif;font-size:1.1rem;font-weight:800;margin-bottom:.75rem;}
-    .usr-avatar.emp{background:var(--green);}
-
-    .empty{text-align:center;padding:3rem;color:var(--ink-soft);}
-    .empty .icon{font-size:2.5rem;margin-bottom:.75rem;}
-    .spinner{border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;width:28px;height:28px;
-      animation:spin .7s linear infinite;margin:3rem auto;}
-    @keyframes spin{to{transform:rotate(360deg)}}
-    .toast{position:fixed;bottom:1.5rem;right:1.5rem;background:var(--accent);color:#fff;padding:.75rem 1.25rem;
-      border-radius:10px;font-size:.85rem;font-weight:600;z-index:300;animation:slideUp .25s ease;}
-    @keyframes slideUp{from{transform:translateY(12px);opacity:0}to{transform:translateY(0);opacity:1}}
-
-    @media(max-width:700px){
-      .stats{grid-template-columns:1fr 1fr;}
-      .report-grid{grid-template-columns:1fr;}
-      .form-grid{grid-template-columns:1fr;}
-      .nav-tabs{display:none;}
+# ─────────────────────────────────────────
+# CLAUDE VISION
+# ─────────────────────────────────────────
+async def analizar_ticket(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
+    if len(image_bytes) > 1_000_000:
+        image_bytes = image_bytes[:1_000_000]
+    image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+    payload = {
+        "model": "claude-sonnet-4-5-20250929",
+        "max_tokens": 512,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
+                {"type": "text", "text": (
+                    "Analizá este ticket/comprobante de pago y extraé los siguientes datos en formato JSON estricto:\n"
+                    "{\n"
+                    '  "monto": <número con decimales, solo el total final>,\n'
+                    '  "moneda": <"ARS" o "USD">,\n'
+                    '  "fecha": <"YYYY-MM-DD" — la fecha de emisión del ticket/comprobante, NO la fecha de inicio de actividades del comercio — usá el año 2026 si no se ve claramente>,\n'
+                    '  "descripcion": <descripción breve del comercio, máximo 60 caracteres>,\n'
+                    '  "metodo_pago": <"Efectivo", "Tarjeta de crédito", "Tarjeta de débito", "Transferencia" o "Otros">\n'
+                    "}\n"
+                    "Si no podés leer algún campo, ponelo como null. Respondé SOLO el JSON."
+                )}
+            ]
+        }]
     }
-  </style>
-</head>
-<body>
-<div id="root"></div>
-<script>
-const API = 'https://gastos-pertrak-production.up.railway.app';
-const {useState,useEffect,createElement:h} = React;
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json=payload
+        )
+        if not r.is_success:
+            raise Exception(f"API error {r.status_code}: {r.text}")
+        text = r.json()["content"][0]["text"].strip()
+        text = text.replace("```json","").replace("```","").strip()
+        return json.loads(text)
 
-const CATS = ["Refrigerio","Viáticos","Transporte","Combustible","Alojamiento","Papelería","Herramientas","Telefonía","Representación","Otros"];
-const METODOS = ["Efectivo","Tarjeta de crédito","Tarjeta de débito","Transferencia","Otros"];
-const METODO_ICONS = {"Efectivo":"💵","Tarjeta de crédito":"💳","Tarjeta de débito":"💳","Transferencia":"🏦","Otros":"📋"};
+# ─────────────────────────────────────────
+# TELEGRAM BOT
+# ─────────────────────────────────────────
+async def send_msg(chat_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    async with httpx.AsyncClient() as client:
+        await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
 
-const fmt = n => n ? new Intl.NumberFormat('es-AR',{minimumFractionDigits:2}).format(n) : '0,00';
-const today = () => new Date().toISOString().slice(0,10);
-const mesActual = () => { const d=new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-01`; };
-const initials = n => n ? n.split(' ').map(p=>p[0]).join('').slice(0,2).toUpperCase() : '?';
+def make_keyboard(options, columns=2):
+    keyboard = []
+    for i in range(0, len(options), columns):
+        keyboard.append([{"text": o} for o in options[i:i+columns]])
+    return {"keyboard": keyboard, "one_time_keyboard": True, "resize_keyboard": True}
 
-function Toast({msg}){ return msg ? h('div',{className:'toast'},msg) : null; }
+def remove_keyboard():
+    return {"remove_keyboard": True}
 
-// ── AUTH helpers ──
-function getToken(){ return localStorage.getItem('gp_token'); }
-function getUser(){ try{ return JSON.parse(localStorage.getItem('gp_user')); }catch{ return null; } }
-function authHeaders(){ return {'Content-Type':'application/json','Authorization':'Bearer '+getToken()}; }
+async def get_file_bytes(file_id: str) -> tuple:
+    async with httpx.AsyncClient() as client:
+        r = await client.get(f"{TELEGRAM_API}/getFile?file_id={file_id}")
+        file_path = r.json()["result"]["file_path"]
+        mime = "image/png" if file_path.endswith(".png") else "image/jpeg"
+        file_r = await client.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}")
+        return file_r.content, mime
 
-// ── LOGIN ──
-function Login({onLogin}){
-  const [form,setForm] = useState({username:'',password:''});
-  const [err,setErr] = useState('');
-  const [loading,setLoading] = useState(false);
-  const set = k => e => setForm(f=>({...f,[k]:e.target.value}));
+async def process_update(update: dict):
+    msg = update.get("message") or update.get("edited_message")
+    if not msg:
+        return
+    chat_id   = str(msg["chat"]["id"])
+    text      = msg.get("text","").strip()
+    photo     = msg.get("photo")
+    document  = msg.get("document")
+    from_user = msg.get("from", {})
+    tg_name   = (from_user.get("first_name","") + " " + from_user.get("last_name","")).strip()
 
-  async function submit(e){
-    e.preventDefault();
-    setLoading(true); setErr('');
-    try{
-      const r = await fetch(`${API}/auth/login`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(form)});
-      if(!r.ok){ setErr('Usuario o contraseña incorrectos'); return; }
-      const data = await r.json();
-      localStorage.setItem('gp_token', data.token);
-      localStorage.setItem('gp_user', JSON.stringify({nombre:data.nombre,rol:data.rol,username:data.username}));
-      onLogin(data);
-    }catch{ setErr('Error de conexión'); }
-    finally{ setLoading(false); }
-  }
+    conn = get_db()
+    emp = conn.execute("SELECT * FROM empleados WHERE telegram_id=?", (chat_id,)).fetchone()
+    if not emp:
+        conn.execute("INSERT OR IGNORE INTO empleados (telegram_id,nombre) VALUES (?,?)",
+                     (chat_id, tg_name or f"Usuario {chat_id}"))
+        conn.commit()
+        emp = conn.execute("SELECT * FROM empleados WHERE telegram_id=?", (chat_id,)).fetchone()
+    emp = dict(emp)
+    conn.close()
 
-  return h('div',{className:'login-wrap'},
-    h('div',{className:'login-box'},
-      h('div',{className:'login-logo'},'💰 Gastos ',h('span',null,'Pertrak')),
-      h('div',{className:'login-sub'},'Sistema de gestión de gastos'),
-      err && h('div',{className:'login-err'},'⚠️ '+err),
-      h('form',{onSubmit:submit},
-        h('div',{className:'login-field'},h('label',null,'Usuario'),h('input',{value:form.username,onChange:set('username'),placeholder:'usuario',autoComplete:'username'})),
-        h('div',{className:'login-field'},h('label',null,'Contraseña'),h('input',{type:'password',value:form.password,onChange:set('password'),placeholder:'••••••••',autoComplete:'current-password'})),
-        h('button',{className:'btn-login',type:'submit',disabled:loading},loading?'Ingresando…':'Ingresar')
-      ),
-      h('div',{className:'login-hint'},'Usuario por defecto: admin / admin123')
-    )
-  );
-}
+    state = get_state(chat_id)
 
-// ── MODAL GASTO ──
-function ModalGasto({empleados, gasto, onClose, onSaved, user}){
-  const editing = !!gasto;
-  const [form,setForm] = useState({
-    empleado_id: gasto?.empleado_id||'',
-    fecha: gasto?.fecha||today(),
-    monto: gasto?.monto||'',
-    moneda: gasto?.moneda||'ARS',
-    categoria: gasto?.categoria||'',
-    metodo_pago: gasto?.metodo_pago||'Efectivo',
-    descripcion: gasto?.descripcion||'',
-  });
-  const [loading,setLoading] = useState(false);
-  const set = k => e => setForm(f=>({...f,[k]:e.target.value}));
+    if text in ("/start", "/ayuda", "/help"):
+        clear_state(chat_id)
+        await send_msg(chat_id,
+            f"👋 Hola <b>{emp['nombre']}</b>!\n\n"
+            "📸 <b>Mandá una foto del ticket</b> → registro automático\n"
+            "💸 /nuevo → Cargar manualmente\n"
+            "📋 /misgastos → Ver tus gastos\n"
+            "❓ /ayuda → Esta ayuda",
+            make_keyboard(["/nuevo", "/misgastos"])
+        )
+        return
 
-  async function submit(){
-    if(!form.fecha||!form.monto||!form.categoria||!form.metodo_pago){ alert('Completá todos los campos obligatorios'); return; }
-    setLoading(true);
-    try{
-      const url = editing ? `${API}/gastos/${gasto.id}` : `${API}/gastos`;
-      const method = editing ? 'PUT' : 'POST';
-      const body = {...form, monto:parseFloat(form.monto)};
-      if(form.empleado_id) body.empleado_id = parseInt(form.empleado_id);
-      const r = await fetch(url,{method,headers:authHeaders(),body:JSON.stringify(body)});
-      if(!r.ok){ const e=await r.json(); throw new Error(e.detail||'Error'); }
-      onSaved();
-    }catch(e){ alert(e.message); }
-    finally{ setLoading(false); }
-  }
+    if text == "/misgastos":
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT fecha,categoria,metodo_pago,monto,moneda,descripcion FROM gastos WHERE empleado_id=? ORDER BY fecha DESC LIMIT 20",
+            (emp["id"],)
+        ).fetchall()
+        conn.close()
+        if not rows:
+            await send_msg(chat_id, "📭 No tenés gastos registrados todavía.")
+        else:
+            total_ars = sum(r["monto"] for r in rows if r["moneda"]=="ARS")
+            total_usd = sum(r["monto"] for r in rows if r["moneda"]=="USD")
+            lines = ["📋 <b>Tus últimos gastos:</b>\n"]
+            for r in rows:
+                mp = f" [{r['metodo_pago']}]" if r["metodo_pago"] else ""
+                lines.append(f"• {r['fecha']} | {r['categoria']}{mp} | <b>{r['moneda']} ${r['monto']:,.2f}</b>{' — '+r['descripcion'] if r['descripcion'] else ''}")
+            lines.append(f"\n💰 <b>Total ARS: ${total_ars:,.2f}</b>")
+            if total_usd:
+                lines.append(f"💵 <b>Total USD: ${total_usd:,.2f}</b>")
+            await send_msg(chat_id, "\n".join(lines))
+        return
 
-  return h('div',{className:'overlay',onClick:e=>e.target===e.currentTarget&&onClose()},
-    h('div',{className:'modal'},
-      h('h2',null,editing?'Editar gasto':'Nuevo gasto'),
-      h('div',{className:'form-grid'},
-        user.rol==='admin' && h('div',{className:'field full'},
-          h('label',null,'Empleado (opcional)'),
-          h('select',{value:form.empleado_id,onChange:set('empleado_id')},
-            h('option',{value:''},'— Sin asignar —'),
-            empleados.map(e=>h('option',{key:e.id,value:e.id},e.nombre))
-          )
-        ),
-        h('div',{className:'field'},h('label',null,'Fecha'),h('input',{type:'date',value:form.fecha,onChange:set('fecha')})),
-        h('div',{className:'field'},
-          h('label',null,'Moneda'),
-          h('select',{value:form.moneda,onChange:set('moneda')},
-            h('option',{value:'ARS'},'🇦🇷 ARS'),
-            h('option',{value:'USD'},'🇺🇸 USD')
-          )
-        ),
-        h('div',{className:'field'},h('label',null,'Monto'),h('input',{type:'number',step:'0.01',placeholder:'0.00',value:form.monto,onChange:set('monto')})),
-        h('div',{className:'field'},
-          h('label',null,'Categoría'),
-          h('select',{value:form.categoria,onChange:set('categoria')},
-            h('option',{value:''},'— Categoría —'),
-            CATS.map(c=>h('option',{key:c,value:c},c))
-          )
-        ),
-        h('div',{className:'field'},
-          h('label',null,'Método de pago'),
-          h('select',{value:form.metodo_pago,onChange:set('metodo_pago')},
-            METODOS.map(m=>h('option',{key:m,value:m},METODO_ICONS[m]+' '+m))
-          )
-        ),
-        h('div',{className:'field full'},h('label',null,'Descripción'),h('input',{type:'text',placeholder:'Detalle del gasto…',value:form.descripcion,onChange:set('descripcion')}))
-      ),
-      h('div',{className:'modal-footer'},
-        h('button',{className:'btn btn-ghost',onClick:onClose},'Cancelar'),
-        h('button',{className:'btn btn-primary',onClick:submit,disabled:loading},loading?'Guardando…':editing?'Guardar':'Registrar gasto')
-      )
-    )
-  );
-}
-
-// ── TAB GASTOS ──
-function TabGastos({empleados, user}){
-  const [gastos,setGastos] = useState([]);
-  const [loading,setLoading] = useState(false);
-  const [error,setError] = useState('');
-  const [modal,setModal] = useState(null);
-  const [toast,setToast] = useState('');
-  const [filtros,setFiltros] = useState({desde:mesActual(),hasta:today(),categoria:'',moneda:'',metodo_pago:'',empleado_id:''});
-  function showToast(m){ setToast(m); setTimeout(()=>setToast(''),2800); }
-  const setF = k => e => setFiltros(f=>({...f,[k]:e.target.value}));
-
-  async function cargar(){
-    setLoading(true);
-    setError('');
-    const p = new URLSearchParams();
-    Object.entries(filtros).forEach(([k,v])=>{ if(v) p.set(k,v); });
-    try{ const r=await fetch(`${API}/gastos?${p}`,{headers:authHeaders()}); setGastos(await r.json()); }
-    catch(e){ setError('Error al cargar gastos: '+e.message); setGastos([]); }
-    finally{ setLoading(false); }
-  }
-
-  useEffect(()=>{ cargar(); },[filtros]);
-
-  async function eliminar(id){
-    if(!confirm('¿Eliminar este gasto?')) return;
-    await fetch(`${API}/gastos/${id}`,{method:'DELETE',headers:authHeaders()});
-    showToast('Gasto eliminado'); cargar();
-  }
-
-  async function cambiarEstado(id, estado){
-    await fetch(`${API}/gastos/${id}`,{method:'PUT',headers:authHeaders(),body:JSON.stringify({estado})});
-    showToast(`Marcado como ${estado}`); cargar();
-  }
-
-  function exportar(){
-    const p = new URLSearchParams();
-    if(filtros.desde) p.set('desde',filtros.desde);
-    if(filtros.hasta) p.set('hasta',filtros.hasta);
-    window.open(`${API}/exportar/excel?${p}&token=${getToken()}`,'_blank');
-  }
-
-  const totalARS = gastos.filter(g=>g.moneda==='ARS').reduce((s,g)=>s+g.monto,0);
-  const totalUSD = gastos.filter(g=>g.moneda==='USD').reduce((s,g)=>s+g.monto,0);
-
-  return h('div',null,
-    h('div',{className:'top-bar'},
-      h('div',{className:'page-title'},'Gastos',h('small',null,`${gastos.length} registros`)),
-      h('div',{style:{display:'flex',gap:'.5rem'}},
-        user.rol==='admin' && h('button',{className:'btn btn-export',onClick:exportar},'⬇ Exportar CSV'),
-        h('button',{className:'btn btn-primary',onClick:()=>setModal('nuevo')},'＋ Nuevo gasto')
-      )
-    ),
-    h('div',{className:'stats'},
-      h('div',{className:'stat'},h('div',{className:'stat-val green'},'$'+fmt(totalARS)),h('div',{className:'stat-lbl'},'Total ARS')),
-      h('div',{className:'stat'},h('div',{className:'stat-val gold'},'$'+fmt(totalUSD)),h('div',{className:'stat-lbl'},'Total USD')),
-      h('div',{className:'stat'},h('div',{className:'stat-val purple'},gastos.length),h('div',{className:'stat-lbl'},'Registros')),
-      h('div',{className:'stat'},h('div',{className:'stat-val red'},gastos.filter(g=>g.estado==='pendiente').length),h('div',{className:'stat-lbl'},'Pendientes'))
-    ),
-    h('div',{className:'filters'},
-      h('div',null,h('input',{type:'date',value:filtros.desde,onChange:setF('desde')})),
-      h('div',null,h('input',{type:'date',value:filtros.hasta,onChange:setF('hasta')})),
-      h('select',{value:filtros.categoria,onChange:setF('categoria')},
-        h('option',{value:''},'Todas las categorías'),
-        CATS.map(c=>h('option',{key:c,value:c},c))
-      ),
-      h('select',{value:filtros.metodo_pago,onChange:setF('metodo_pago')},
-        h('option',{value:''},'Todos los métodos'),
-        METODOS.map(m=>h('option',{key:m,value:m},METODO_ICONS[m]+' '+m))
-      ),
-      h('select',{value:filtros.moneda,onChange:setF('moneda')},
-        h('option',{value:''},'ARS + USD'),
-        h('option',{value:'ARS'},'Solo ARS'),
-        h('option',{value:'USD'},'Solo USD')
-      ),
-      user.rol==='admin' && h('select',{value:filtros.empleado_id,onChange:setF('empleado_id')},
-        h('option',{value:''},'Todos los empleados'),
-        empleados.map(e=>h('option',{key:e.id,value:e.id},e.nombre))
-      )
-    ),
-    loading && h('div',{className:'spinner'}),
-    error && h('div',{className:'empty'},h('div',{className:'icon'},'⚠️'),h('p',null,error),h('button',{className:'btn btn-primary',onClick:cargar},'Reintentar')),
-    !loading && !error && gastos.length===0 && h('div',{className:'empty'},h('div',{className:'icon'},'💸'),h('p',null,'Sin gastos para los filtros seleccionados')),
-    !loading && gastos.length>0 && h('div',{className:'table-wrap'},
-      h('table',null,
-        h('thead',null,h('tr',null,
-          h('th',null,'Fecha'),h('th',null,'Empleado'),h('th',null,'Categoría'),
-          h('th',null,'Método'),h('th',null,'Monto'),h('th',null,'Estado'),h('th',null,'Acciones')
-        )),
-        h('tbody',null,
-          gastos.map(g=>h('tr',{key:g.id},
-            h('td',null,g.fecha),
-            h('td',null,g.empleado||'—'),
-            h('td',null,g.categoria),
-            h('td',null,h('span',{className:'badge badge-mp'},METODO_ICONS[g.metodo_pago]||'📋',' ',g.metodo_pago||'—')),
-            h('td',null,h('span',{className:`badge badge-${g.moneda.toLowerCase()}`},g.moneda),' $'+fmt(g.monto)),
-            h('td',null,h('span',{className:`badge badge-${g.estado}`},g.estado)),
-            h('td',null,
-              h('div',{style:{display:'flex',gap:'.35rem',flexWrap:'wrap'}},
-                user.rol==='admin' && g.estado==='pendiente' && h('button',{className:'btn btn-green btn-sm',onClick:()=>cambiarEstado(g.id,'aprobado')},'✓'),
-                user.rol==='admin' && g.estado==='pendiente' && h('button',{className:'btn btn-ghost btn-sm btn-red',onClick:()=>cambiarEstado(g.id,'rechazado')},'✕'),
-                h('button',{className:'btn btn-ghost btn-sm',onClick:()=>setModal(g)},'✏'),
-                user.rol==='admin' && h('button',{className:'btn btn-ghost btn-sm btn-red',onClick:()=>eliminar(g.id)},'🗑')
-              )
+    # FOTO
+    if photo or (document and document.get("mime_type","").startswith("image/")):
+        await send_msg(chat_id, "🔍 Analizando tu ticket con IA, un momento…", remove_keyboard())
+        try:
+            file_id = photo[-1]["file_id"] if photo else document["file_id"]
+            img_bytes, mime = await get_file_bytes(file_id)
+            datos = await analizar_ticket(img_bytes, mime)
+            monto = datos.get("monto")
+            moneda = datos.get("moneda") or "ARS"
+            fecha = datos.get("fecha") or date.today().isoformat()
+            descripcion = datos.get("descripcion") or ""
+            metodo_pago = datos.get("metodo_pago") or "Efectivo"
+            if metodo_pago not in METODOS_PAGO:
+                metodo_pago = "Efectivo"
+            if not monto:
+                await send_msg(chat_id, "⚠️ No pude leer el monto. Intentá de nuevo o usá /nuevo.")
+                return
+            set_state(chat_id, "categoria_ticket", {
+                "empleado_id": emp["id"], "fecha": fecha, "monto": monto,
+                "moneda": moneda, "descripcion": descripcion, "metodo_pago": metodo_pago
+            })
+            await send_msg(chat_id,
+                f"✅ <b>Ticket leído:</b>\n\n"
+                f"📅 {fecha} | 💰 {moneda} ${monto:,.2f}\n"
+                f"💳 Método: <b>{metodo_pago}</b>\n"
+                f"📝 {descripcion or '—'}\n\n"
+                "¿En qué categoría lo registramos?",
+                make_keyboard(CATEGORIAS, 2)
             )
-          ))
+        except Exception as ex:
+            await send_msg(chat_id, f"⚠️ No pude procesar la imagen: {str(ex)}\nUsá /nuevo para cargarlo manualmente.")
+        return
+
+    if state.get("step") == "categoria_ticket":
+        cat_match = next((c for c in CATEGORIAS if c.lower() == text.lower() or c in text or text in c), None)
+        if not cat_match:
+            await send_msg(chat_id, "⚠️ Elegí una categoría.", make_keyboard(CATEGORIAS, 2))
+            return
+        d = state["data"]
+        d["categoria"] = cat_match
+        set_state(chat_id, "moneda_ticket", d)
+        await send_msg(chat_id,
+            f"🗂 <b>Categoría:</b> {cat_match}\n\n"
+            f"💱 <b>Moneda actual:</b> {d['moneda']}\n"
+            f"¿Es correcta? Elegí la moneda:",
+            make_keyboard(["ARS 🇦🇷", "USD 🇺🇸"], 2)
         )
-      )
-    ),
-    modal && h(ModalGasto,{
-      empleados, user,
-      gasto: modal==='nuevo'?null:modal,
-      onClose:()=>setModal(null),
-      onSaved:()=>{ setModal(null); cargar(); showToast(modal==='nuevo'?'Gasto registrado ✓':'Gasto actualizado ✓'); }
-    }),
-    h(Toast,{msg:toast})
-  );
-}
+        return
 
-// ── TAB REPORTES ──
-function TabReportes({user}){
-  const [data,setData] = useState(null);
-  const [desde,setDesde] = useState(mesActual());
-  const [hasta,setHasta] = useState(today());
+    if text == "/nuevo":
+        set_state(chat_id, "fecha", {"empleado_id": emp["id"]})
+        await send_msg(chat_id, "📅 <b>Paso 1/6</b> — Fecha del gasto (YYYY-MM-DD o <b>hoy</b>):", remove_keyboard())
+        return
 
-  async function cargar(){
-    const p = new URLSearchParams({desde,hasta});
-    const r = await fetch(`${API}/resumen?${p}`,{headers:authHeaders()});
-    setData(await r.json());
-  }
-
-  useEffect(()=>{ cargar(); },[desde,hasta]);
-  if(!data) return h('div',{className:'spinner'});
-
-  return h('div',null,
-    h('div',{className:'top-bar'},
-      h('div',{className:'page-title'},'Reportes'),
-      h('div',{className:'filters'},
-        h('input',{type:'date',value:desde,onChange:e=>setDesde(e.target.value)}),
-        h('input',{type:'date',value:hasta,onChange:e=>setHasta(e.target.value)}),
-        h('button',{className:'btn btn-primary',onClick:cargar},'Actualizar')
-      )
-    ),
-    h('div',{className:'stats'},
-      h('div',{className:'stat'},h('div',{className:'stat-val green'},'$'+fmt(data.total_ars)),h('div',{className:'stat-lbl'},'Total ARS')),
-      h('div',{className:'stat'},h('div',{className:'stat-val gold'},'$'+fmt(data.total_usd)),h('div',{className:'stat-lbl'},'Total USD')),
-      h('div',{className:'stat'},h('div',{className:'stat-val purple'},data.por_categoria.length),h('div',{className:'stat-lbl'},'Categorías')),
-      h('div',{className:'stat'},h('div',{className:'stat-val red'},data.por_empleado.length),h('div',{className:'stat-lbl'},'Personas'))
-    ),
-    h('div',{className:'report-grid'},
-      h('div',{className:'report-card'},
-        h('h3',null,'Por categoría'),
-        data.por_categoria.map((r,i)=>h('div',{key:i,className:'report-row'},
-          h('span',null,r.categoria+' ('+r.moneda+')'),
-          h('div',null,h('strong',null,'$'+fmt(r.total)),h('span',{style:{color:'var(--ink-soft)',marginLeft:'.5rem',fontSize:'.75rem'}},r.qty+' gastos'))
-        ))
-      ),
-      h('div',{className:'report-card'},
-        h('h3',null,'Por método de pago (ARS)'),
-        data.por_metodo_pago.map((r,i)=>h('div',{key:i,className:'report-row'},
-          h('span',null,(METODO_ICONS[r.metodo_pago]||'📋')+' '+r.metodo_pago),
-          h('div',null,h('strong',null,'$'+fmt(r.total)),h('span',{style:{color:'var(--ink-soft)',marginLeft:'.5rem',fontSize:'.75rem'}},r.qty+' gastos'))
-        ))
-      ),
-      h('div',{className:'report-card'},
-        h('h3',null,'Por persona'),
-        data.por_empleado.map((r,i)=>h('div',{key:i,className:'report-row'},
-          h('span',null,r.nombre+' ('+r.moneda+')'),
-          h('div',null,h('strong',null,'$'+fmt(r.total)),h('span',{style:{color:'var(--ink-soft)',marginLeft:'.5rem',fontSize:'.75rem'}},r.qty+' gastos'))
-        ))
-      ),
-      h('div',{className:'report-card'},
-        h('h3',null,'Por mes'),
-        data.por_mes.map((r,i)=>h('div',{key:i,className:'report-row'},
-          h('span',null,r.mes+' ('+r.moneda+')'),
-          h('strong',null,'$'+fmt(r.total))
-        ))
-      )
-    )
-  );
-}
-
-// ── TAB USUARIOS (solo admin) ──
-function TabUsuarios(){
-  const [usuarios,setUsuarios] = useState([]);
-  const [modal,setModal] = useState(false);
-  const [form,setForm] = useState({username:'',password:'',nombre:'',rol:'empleado'});
-  const [toast,setToast] = useState('');
-  function showToast(m){ setToast(m); setTimeout(()=>setToast(''),2800); }
-  const set = k => e => setForm(f=>({...f,[k]:e.target.value}));
-
-  async function cargar(){ const r=await fetch(`${API}/usuarios`,{headers:authHeaders()}); setUsuarios(await r.json()); }
-  useEffect(()=>{ cargar(); },[]);
-
-  async function crear(){
-    if(!form.username||!form.password||!form.nombre){ alert('Completá todos los campos'); return; }
-    const r = await fetch(`${API}/usuarios`,{method:'POST',headers:authHeaders(),body:JSON.stringify(form)});
-    if(!r.ok){ const e=await r.json(); alert(e.detail); return; }
-    setModal(false); setForm({username:'',password:'',nombre:'',rol:'empleado'}); cargar(); showToast('Usuario creado ✓');
-  }
-
-  async function desactivar(u){
-    if(!confirm(`¿Desactivar a ${u.nombre}?`)) return;
-    await fetch(`${API}/usuarios/${u.id}`,{method:'DELETE',headers:authHeaders()});
-    showToast('Usuario desactivado'); cargar();
-  }
-
-  return h('div',null,
-    h('div',{className:'top-bar'},
-      h('div',{className:'page-title'},'Usuarios',h('small',null,`${usuarios.filter(u=>u.activo).length} activos`)),
-      h('button',{className:'btn btn-primary',onClick:()=>setModal(true)},'＋ Nuevo usuario')
-    ),
-    h('div',{className:'usr-grid'},
-      usuarios.map(u=>h('div',{key:u.id,className:'usr-card',style:{opacity:u.activo?1:.5}},
-        h('div',{className:`usr-avatar${u.rol==='empleado'?' emp':''}`},initials(u.nombre)),
-        h('div',{style:{display:'flex',alignItems:'center',gap:'.5rem',marginBottom:'.25rem'}},
-          h('h3',{style:{fontSize:'.95rem',fontWeight:600}},u.nombre),
-          h('span',{className:`role-badge role-${u.rol}`},u.rol)
-        ),
-        h('p',{style:{fontSize:'.8rem',color:'var(--ink-soft)'}},u.username),
-        u.activo && u.username!=='admin' && h('div',{style:{display:'flex',gap:'.5rem',marginTop:'.75rem'}},
-          h('button',{className:'btn btn-ghost btn-sm btn-red',onClick:()=>desactivar(u)},'✕ Desactivar')
+    if state.get("step") == "moneda_ticket":
+        moneda = "ARS" if "ARS" in text else "USD" if "USD" in text else None
+        if not moneda:
+            await send_msg(chat_id, "⚠️ Elegí ARS o USD.", make_keyboard(["ARS 🇦🇷", "USD 🇺🇸"], 2))
+            return
+        d = state["data"]
+        d["moneda"] = moneda
+        set_state(chat_id, "metodo_pago_ticket", d)
+        await send_msg(chat_id,
+            f"💱 <b>Moneda:</b> {moneda}\n\n"
+            f"💳 <b>Método actual:</b> {d['metodo_pago']}\n"
+            f"¿Es correcto? Elegí el método de pago:",
+            make_keyboard(METODOS_PAGO, 2)
         )
-      )),
-      usuarios.length===0 && h('div',{className:'empty',style:{gridColumn:'1/-1'}},h('div',{className:'icon'},'👥'),h('p',null,'Sin usuarios'))
-    ),
-    modal && h('div',{className:'overlay',onClick:e=>e.target===e.currentTarget&&setModal(false)},
-      h('div',{className:'modal'},
-        h('h2',null,'Nuevo usuario'),
-        h('div',{className:'form-grid'},
-          h('div',{className:'field full'},h('label',null,'Nombre completo'),h('input',{value:form.nombre,onChange:set('nombre'),placeholder:'Juan Pérez'})),
-          h('div',{className:'field'},h('label',null,'Usuario'),h('input',{value:form.username,onChange:set('username'),placeholder:'juanp'})),
-          h('div',{className:'field'},h('label',null,'Contraseña'),h('input',{type:'password',value:form.password,onChange:set('password'),placeholder:'••••••••'})),
-          h('div',{className:'field full'},
-            h('label',null,'Rol'),
-            h('select',{value:form.rol,onChange:set('rol')},
-              h('option',{value:'empleado'},'👤 Empleado — solo ve sus gastos'),
-              h('option',{value:'admin'},'⚡ Administrador — ve todo')
+        return
+
+    if state.get("step") == "metodo_pago_ticket":
+        mp_match = next((m for m in METODOS_PAGO if m.lower() == text.lower() or m in text or text in m), None)
+        if not mp_match:
+            await send_msg(chat_id, "⚠️ Elegí un método de pago.", make_keyboard(METODOS_PAGO, 2))
+            return
+        try:
+            d = state["data"]
+            monto = float(d["monto"])
+            conn = get_db()
+            conn.execute(
+                "INSERT INTO gastos (empleado_id,fecha,monto,moneda,categoria,metodo_pago,descripcion) VALUES (?,?,?,?,?,?,?)",
+                (d["empleado_id"], d["fecha"], monto, d["moneda"], d["categoria"], mp_match, d.get("descripcion"))
             )
-          )
-        ),
-        h('div',{className:'modal-footer'},
-          h('button',{className:'btn btn-ghost',onClick:()=>setModal(false)},'Cancelar'),
-          h('button',{className:'btn btn-primary',onClick:crear},'Crear usuario')
+            conn.commit()
+            conn.close()
+            clear_state(chat_id)
+            await send_msg(chat_id,
+                f"🎉 <b>Gasto registrado:</b>\n"
+                f"📅 {d['fecha']} | 🗂 {d['categoria']}\n"
+                f"💰 {d['moneda']} ${monto:,.2f} | 💳 {mp_match}\n"
+                f"📝 {d.get('descripcion') or '—'}\n\n¿Tenés otro ticket?",
+                make_keyboard(["/nuevo", "/misgastos"])
+            )
+        except Exception as ex:
+            clear_state(chat_id)
+            await send_msg(chat_id,
+                f"⚠️ Error al registrar: {str(ex)}\nUsá /nuevo para intentar de nuevo.",
+                make_keyboard(["/nuevo", "/misgastos"])
+            )
+        return
+
+    if state.get("step") == "fecha":
+        fecha = date.today().isoformat() if text.lower() == "hoy" else text
+        try: datetime.strptime(fecha, "%Y-%m-%d")
+        except:
+            await send_msg(chat_id, "⚠️ Formato incorrecto. Usá YYYY-MM-DD o <b>hoy</b>.")
+            return
+        d = state["data"]; d["fecha"] = fecha
+        set_state(chat_id, "categoria", d)
+        await send_msg(chat_id, "🗂 <b>Paso 2/6</b> — Categoría:", make_keyboard(CATEGORIAS, 2))
+        return
+
+    if state.get("step") == "categoria":
+        # Buscar coincidencia flexible (ignora mayúsculas/tildes parciales)
+        cat_match = next((c for c in CATEGORIAS if c.lower() == text.lower() or c in text or text in c), None)
+        if not cat_match:
+            await send_msg(chat_id, "⚠️ Elegí una categoría de la lista.", make_keyboard(CATEGORIAS, 2))
+            return
+        d = state["data"]; d["categoria"] = cat_match
+        set_state(chat_id, "metodo_pago", d)
+        await send_msg(chat_id, "💳 <b>Paso 3/6</b> — Método de pago:", make_keyboard(METODOS_PAGO, 2))
+        return
+
+    if state.get("step") == "metodo_pago":
+        mp_match = next((m for m in METODOS_PAGO if m.lower() == text.lower() or m in text or text in m), None)
+        if not mp_match:
+            await send_msg(chat_id, "⚠️ Elegí un método de pago.", make_keyboard(METODOS_PAGO, 2))
+            return
+        d = state["data"]; d["metodo_pago"] = mp_match
+        set_state(chat_id, "moneda", d)
+        await send_msg(chat_id, "💱 <b>Paso 4/6</b> — Moneda:", make_keyboard(["ARS 🇦🇷", "USD 🇺🇸"], 2))
+        return
+
+    if state.get("step") == "moneda":
+        moneda = "ARS" if "ARS" in text else "USD" if "USD" in text else None
+        if not moneda:
+            await send_msg(chat_id, "⚠️ Elegí ARS o USD.", make_keyboard(["ARS 🇦🇷", "USD 🇺🇸"], 2))
+            return
+        d = state["data"]; d["moneda"] = moneda
+        set_state(chat_id, "monto", d)
+        await send_msg(chat_id, f"💰 <b>Paso 5/6</b> — Monto en {moneda}:", remove_keyboard())
+        return
+
+    if state.get("step") == "monto":
+        try: monto = float(text.replace(",",".").replace("$","").strip())
+        except:
+            await send_msg(chat_id, "⚠️ Ingresá solo el número, ej: <b>1500.50</b>")
+            return
+        d = state["data"]; d["monto"] = monto
+        set_state(chat_id, "descripcion", d)
+        await send_msg(chat_id, "📝 <b>Paso 6/6</b> — Descripción (o <b>-</b> para omitir):", remove_keyboard())
+        return
+
+    if state.get("step") == "descripcion":
+        desc = None if text == "-" else text
+        d = state["data"]
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO gastos (empleado_id,fecha,monto,moneda,categoria,metodo_pago,descripcion) VALUES (?,?,?,?,?,?,?)",
+            (d["empleado_id"], d["fecha"], d["monto"], d["moneda"], d["categoria"], d.get("metodo_pago","Efectivo"), desc)
         )
-      )
-    ),
-    h(Toast,{msg:toast})
-  );
-}
+        conn.commit()
+        conn.close()
+        clear_state(chat_id)
+        await send_msg(chat_id,
+            f"✅ <b>Gasto registrado:</b>\n"
+            f"📅 {d['fecha']} | 🗂 {d['categoria']}\n"
+            f"💰 {d['moneda']} ${d['monto']:,.2f} | 💳 {d.get('metodo_pago','Efectivo')}\n"
+            f"📝 {desc or '—'}\n\n¿Registrar otro?",
+            make_keyboard(["/nuevo", "/misgastos"])
+        )
+        return
 
-// ── APP ──
-function App(){
-  const [user,setUser] = useState(getUser());
-  const [tab,setTab] = useState('gastos');
-  const [empleados,setEmpleados] = useState([]);
+    await send_msg(chat_id, "🤖 Mandá una foto del ticket o usá los comandos:", make_keyboard(["/nuevo", "/misgastos"]))
 
-  useEffect(()=>{
-    if(!user) return;
-    fetch(`${API}/empleados`,{headers:authHeaders()}).then(r=>r.json()).then(setEmpleados).catch(()=>{});
-  },[tab,user]);
+@app.post("/webhook", tags=["Telegram"])
+async def webhook(update: dict):
+    asyncio.create_task(process_update(update))
+    return {"ok": True}
 
-  async function logout(){
-    await fetch(`${API}/auth/logout`,{method:'POST',headers:authHeaders()});
-    localStorage.removeItem('gp_token');
-    localStorage.removeItem('gp_user');
-    setUser(null);
-  }
-
-  if(!user) return h(Login,{onLogin:d=>setUser({nombre:d.nombre,rol:d.rol,username:d.username})});
-
-  return h('div',null,
-    h('header',null,
-      h('div',{className:'logo'},'💰 Gastos ',h('span',null,'Pertrak')),
-      h('nav',{className:'nav-tabs'},
-        h('button',{className:`nav-tab${tab==='gastos'?' active':''}`,onClick:()=>setTab('gastos')},'💸 Gastos'),
-        h('button',{className:`nav-tab${tab==='reportes'?' active':''}`,onClick:()=>setTab('reportes')},'📊 Reportes'),
-        user.rol==='admin' && h('button',{className:`nav-tab${tab==='usuarios'?' active':''}`,onClick:()=>setTab('usuarios')},'👥 Usuarios')
-      ),
-      h('div',{className:'header-right'},
-        h('div',{className:'user-chip'},
-          h('span',null,'👤 '+user.nombre),
-          h('span',{className:`role-badge role-${user.rol}`},user.rol)
-        ),
-        h('button',{className:'btn btn-ghost btn-sm',onClick:logout},'Salir')
-      )
-    ),
-    h('div',{className:'container'},
-      tab==='gastos'   && h(TabGastos,{empleados,user}),
-      tab==='reportes' && h(TabReportes,{user}),
-      tab==='usuarios' && user.rol==='admin' && h(TabUsuarios)
-    )
-  );
-}
-
-ReactDOM.createRoot(document.getElementById('root')).render(h(App,null));
-</script>
-</body>
-</html>
+@app.get("/setup-webhook", tags=["Telegram"])
+async def setup_webhook(url: str):
+    async with httpx.AsyncClient() as client:
+        r = await client.post(f"{TELEGRAM_API}/setWebhook", json={"url": f"{url}/webhook"})
+        return r.json()
