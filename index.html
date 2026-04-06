@@ -284,6 +284,7 @@ function ModalGasto({empleados, gasto, onClose, onSaved, user}){
 function TabGastos({empleados, user}){
   const [gastos,setGastos] = useState([]);
   const [loading,setLoading] = useState(false);
+  const [error,setError] = useState('');
   const [modal,setModal] = useState(null);
   const [toast,setToast] = useState('');
   const [filtros,setFiltros] = useState({desde:mesActual(),hasta:today(),categoria:'',moneda:'',metodo_pago:'',empleado_id:''});
@@ -292,10 +293,11 @@ function TabGastos({empleados, user}){
 
   async function cargar(){
     setLoading(true);
+    setError('');
     const p = new URLSearchParams();
     Object.entries(filtros).forEach(([k,v])=>{ if(v) p.set(k,v); });
     try{ const r=await fetch(`${API}/gastos?${p}`,{headers:authHeaders()}); setGastos(await r.json()); }
-    catch{ setGastos([]); }
+    catch(e){ setError('Error al cargar gastos: '+e.message); setGastos([]); }
     finally{ setLoading(false); }
   }
 
@@ -358,7 +360,8 @@ function TabGastos({empleados, user}){
       )
     ),
     loading && h('div',{className:'spinner'}),
-    !loading && gastos.length===0 && h('div',{className:'empty'},h('div',{className:'icon'},'💸'),h('p',null,'Sin gastos para los filtros seleccionados')),
+    error && h('div',{className:'empty'},h('div',{className:'icon'},'⚠️'),h('p',null,error),h('button',{className:'btn btn-primary',onClick:cargar},'Reintentar')),
+    !loading && !error && gastos.length===0 && h('div',{className:'empty'},h('div',{className:'icon'},'💸'),h('p',null,'Sin gastos para los filtros seleccionados')),
     !loading && gastos.length>0 && h('div',{className:'table-wrap'},
       h('table',null,
         h('thead',null,h('tr',null,
