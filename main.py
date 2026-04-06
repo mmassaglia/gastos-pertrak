@@ -625,21 +625,58 @@ async def process_update(update: dict):
         if not cat_match:
             await send_msg(chat_id, "⚠️ Elegí una categoría.", make_keyboard(CATEGORIAS, 2))
             return
+        d = state["data"]
+        d["categoria"] = cat_match
+        set_state(chat_id, "moneda_ticket", d)
+        await send_msg(chat_id,
+            f"🗂 <b>Categoría:</b> {cat_match}\n\n"
+            f"💱 <b>Moneda actual:</b> {d['moneda']}\n"
+            f"¿Es correcta? Elegí la moneda:",
+            make_keyboard(["ARS 🇦🇷", "USD 🇺🇸"], 2)
+        )
+        return
+
+    if text == "/nuevo":
+        set_state(chat_id, "fecha", {"empleado_id": emp["id"]})
+        await send_msg(chat_id, "📅 <b>Paso 1/6</b> — Fecha del gasto (YYYY-MM-DD o <b>hoy</b>):", remove_keyboard())
+        return
+
+    if state.get("step") == "moneda_ticket":
+        moneda = "ARS" if "ARS" in text else "USD" if "USD" in text else None
+        if not moneda:
+            await send_msg(chat_id, "⚠️ Elegí ARS o USD.", make_keyboard(["ARS 🇦🇷", "USD 🇺🇸"], 2))
+            return
+        d = state["data"]
+        d["moneda"] = moneda
+        set_state(chat_id, "metodo_pago_ticket", d)
+        await send_msg(chat_id,
+            f"💱 <b>Moneda:</b> {moneda}\n\n"
+            f"💳 <b>Método actual:</b> {d['metodo_pago']}\n"
+            f"¿Es correcto? Elegí el método de pago:",
+            make_keyboard(METODOS_PAGO, 2)
+        )
+        return
+
+    if state.get("step") == "metodo_pago_ticket":
+        mp_match = next((m for m in METODOS_PAGO if m.lower() == text.lower() or m in text or text in m), None)
+        if not mp_match:
+            await send_msg(chat_id, "⚠️ Elegí un método de pago.", make_keyboard(METODOS_PAGO, 2))
+            return
         try:
             d = state["data"]
             monto = float(d["monto"])
             conn = get_db()
             conn.execute(
                 "INSERT INTO gastos (empleado_id,fecha,monto,moneda,categoria,metodo_pago,descripcion) VALUES (?,?,?,?,?,?,?)",
-                (d["empleado_id"], d["fecha"], monto, d["moneda"], cat_match, d.get("metodo_pago","Efectivo"), d.get("descripcion"))
+                (d["empleado_id"], d["fecha"], monto, d["moneda"], d["categoria"], mp_match, d.get("descripcion"))
             )
             conn.commit()
             conn.close()
             clear_state(chat_id)
             await send_msg(chat_id,
                 f"🎉 <b>Gasto registrado:</b>\n"
-                f"📅 {d['fecha']} | 🗂 {cat_match}\n"
-                f"💰 {d['moneda']} ${monto:,.2f} | 💳 {d.get('metodo_pago','Efectivo')}\n"
+                f"📅 {d['fecha']} | 🗂 {d['categoria']}\n"
+                f"💰 {d['moneda']} ${monto:,.2f} | 💳 {mp_match}\n"
                 f"📝 {d.get('descripcion') or '—'}\n\n¿Tenés otro ticket?",
                 make_keyboard(["/nuevo", "/misgastos"])
             )
@@ -649,11 +686,6 @@ async def process_update(update: dict):
                 f"⚠️ Error al registrar: {str(ex)}\nUsá /nuevo para intentar de nuevo.",
                 make_keyboard(["/nuevo", "/misgastos"])
             )
-        return
-
-    if text == "/nuevo":
-        set_state(chat_id, "fecha", {"empleado_id": emp["id"]})
-        await send_msg(chat_id, "📅 <b>Paso 1/6</b> — Fecha del gasto (YYYY-MM-DD o <b>hoy</b>):", remove_keyboard())
         return
 
     if state.get("step") == "fecha":
