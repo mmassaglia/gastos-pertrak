@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, field_validator
 from typing import Optional
 from datetime import date, datetime
 import sqlite3, io, csv, os, httpx, asyncio, base64, json, hashlib, secrets
@@ -185,7 +185,7 @@ class GastoCreate(BaseModel):
     descripcion: Optional[str] = None
     nro_tarjeta: Optional[str] = None
 
-    @validator('empleado_id', pre=True)
+    @field_validator('empleado_id', mode='before')
     def empty_empleado_id_to_none(cls, v):
         if v == "" or v is None:
             return None
@@ -201,7 +201,7 @@ class GastoUpdate(BaseModel):
     descripcion: Optional[str] = None
     estado: Optional[str] = None
 
-    @validator('empleado_id', pre=True)
+    @field_validator('empleado_id', mode='before')
     def empty_empleado_id_to_none(cls, v):
         if v == "" or v is None:
             return None
