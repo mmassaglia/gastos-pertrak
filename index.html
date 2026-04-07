@@ -167,8 +167,8 @@ const initials = n => n ? n.split(' ').map(p=>p[0]).join('').slice(0,2).toUpperC
 function Toast({msg}){ return msg ? h('div',{className:'toast'},msg) : null; }
 
 // ── AUTH helpers ──
-function getToken(){ return localStorage.getItem('gp_token'); }
-function getUser(){ try{ return JSON.parse(localStorage.getItem('gp_user')); }catch{ return null; } }
+function getToken(){ return sessionStorage.getItem('gp_token'); }
+function getUser(){ try{ return JSON.parse(sessionStorage.getItem('gp_user')); }catch{ return null; } }
 function authHeaders(){ return {'Content-Type':'application/json','Authorization':'Bearer '+getToken()}; }
 
 // ── LOGIN ──
@@ -185,8 +185,8 @@ function Login({onLogin}){
       const r = await fetch(`${API}/auth/login`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(form)});
       if(!r.ok){ setErr('Usuario o contraseña incorrectos'); return; }
       const data = await r.json();
-      localStorage.setItem('gp_token', data.token);
-      localStorage.setItem('gp_user', JSON.stringify({nombre:data.nombre,rol:data.rol,username:data.username}));
+      sessionStorage.setItem('gp_token', data.token);
+      sessionStorage.setItem('gp_user', JSON.stringify({nombre:data.nombre,rol:data.rol,username:data.username}));
       onLogin(data);
     }catch{ setErr('Error de conexión'); }
     finally{ setLoading(false); }
@@ -284,7 +284,6 @@ function ModalGasto({empleados, gasto, onClose, onSaved, user}){
 function TabGastos({empleados, user}){
   const [gastos,setGastos] = useState([]);
   const [loading,setLoading] = useState(false);
-  const [error,setError] = useState('');
   const [modal,setModal] = useState(null);
   const [toast,setToast] = useState('');
   const [filtros,setFiltros] = useState({desde:mesActual(),hasta:today(),categoria:'',moneda:'',metodo_pago:'',empleado_id:''});
@@ -293,16 +292,10 @@ function TabGastos({empleados, user}){
 
   async function cargar(){
     setLoading(true);
-    setError('');
     const p = new URLSearchParams();
     Object.entries(filtros).forEach(([k,v])=>{ if(v) p.set(k,v); });
-    try{
-      const r = await fetch(`${API}/gastos?${p}`,{headers:authHeaders()});
-      const data = await r.json();
-      if(!r.ok) throw new Error(data.detail || data.error || `Error ${r.status}`);
-      if(!Array.isArray(data)) throw new Error('Respuesta inválida del servidor');
-      setGastos(data);
-    }catch(e){ setError('Error al cargar gastos: '+e.message); setGastos([]); }
+    try{ const r=await fetch(`${API}/gastos?${p}`,{headers:authHeaders()}); setGastos(await r.json()); }
+    catch{ setGastos([]); }
     finally{ setLoading(false); }
   }
 
@@ -365,8 +358,7 @@ function TabGastos({empleados, user}){
       )
     ),
     loading && h('div',{className:'spinner'}),
-    error && h('div',{className:'empty'},h('div',{className:'icon'},'⚠️'),h('p',null,error),h('button',{className:'btn btn-primary',onClick:cargar},'Reintentar')),
-    !loading && !error && gastos.length===0 && h('div',{className:'empty'},h('div',{className:'icon'},'💸'),h('p',null,'Sin gastos para los filtros seleccionados')),
+    !loading && gastos.length===0 && h('div',{className:'empty'},h('div',{className:'icon'},'💸'),h('p',null,'Sin gastos para los filtros seleccionados')),
     !loading && gastos.length>0 && h('div',{className:'table-wrap'},
       h('table',null,
         h('thead',null,h('tr',null,
@@ -412,9 +404,7 @@ function TabReportes({user}){
   async function cargar(){
     const p = new URLSearchParams({desde,hasta});
     const r = await fetch(`${API}/resumen?${p}`,{headers:authHeaders()});
-    const data = await r.json();
-    if(!r.ok) throw new Error(data.detail || data.error || `Error ${r.status}`);
-    setData(data);
+    setData(await r.json());
   }
 
   useEffect(()=>{ cargar(); },[desde,hasta]);
@@ -477,12 +467,7 @@ function TabUsuarios(){
   function showToast(m){ setToast(m); setTimeout(()=>setToast(''),2800); }
   const set = k => e => setForm(f=>({...f,[k]:e.target.value}));
 
-  async function cargar(){
-    const r = await fetch(`${API}/usuarios`,{headers:authHeaders()});
-    const data = await r.json();
-    if(!r.ok) throw new Error(data.detail || data.error || `Error ${r.status}`);
-    setUsuarios(data);
-  }
+  async function cargar(){ const r=await fetch(`${API}/usuarios`,{headers:authHeaders()}); setUsuarios(await r.json()); }
   useEffect(()=>{ cargar(); },[]);
 
   async function crear(){
@@ -555,8 +540,8 @@ function App(){
 
   async function logout(){
     await fetch(`${API}/auth/logout`,{method:'POST',headers:authHeaders()});
-    localStorage.removeItem('gp_token');
-    localStorage.removeItem('gp_user');
+    sessionStorage.removeItem('gp_token');
+    sessionStorage.removeItem('gp_user');
     setUser(null);
   }
 
