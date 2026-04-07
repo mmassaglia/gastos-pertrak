@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 from typing import Optional
 from datetime import date, datetime
 import sqlite3, io, csv, os, httpx, asyncio, base64, json, hashlib, secrets
@@ -184,6 +184,12 @@ class GastoCreate(BaseModel):
     metodo_pago: str = "Efectivo"
     descripcion: Optional[str] = None
     nro_tarjeta: Optional[str] = None
+
+    @validator('empleado_id', pre=True)
+    def empty_empleado_id_to_none(cls, v):
+        if v == "" or v is None:
+            return None
+        return v
 
 class GastoUpdate(BaseModel):
     fecha: Optional[str] = None
