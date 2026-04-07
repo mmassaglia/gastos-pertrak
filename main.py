@@ -192,6 +192,7 @@ class GastoCreate(BaseModel):
         return v
 
 class GastoUpdate(BaseModel):
+    empleado_id: Optional[int] = None
     fecha: Optional[str] = None
     monto: Optional[float] = None
     moneda: Optional[str] = None
@@ -199,6 +200,12 @@ class GastoUpdate(BaseModel):
     metodo_pago: Optional[str] = None
     descripcion: Optional[str] = None
     estado: Optional[str] = None
+
+    @validator('empleado_id', pre=True)
+    def empty_empleado_id_to_none(cls, v):
+        if v == "" or v is None:
+            return None
+        return v
 
 # ─────────────────────────────────────────
 # AUTH ENDPOINTS
