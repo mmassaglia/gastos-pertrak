@@ -211,7 +211,7 @@ function Login({onLogin}){
 function ModalGasto({empleados, gasto, onClose, onSaved, user}){
   const editing = !!gasto;
   const [form,setForm] = useState({
-    empleado_id: gasto?.empleado_id != null ? String(gasto.empleado_id) : '',
+    empleado_id: gasto?.empleado_id||'',
     fecha: gasto?.fecha||today(),
     monto: gasto?.monto||'',
     moneda: gasto?.moneda||'ARS',
@@ -229,11 +229,7 @@ function ModalGasto({empleados, gasto, onClose, onSaved, user}){
       const url = editing ? `${API}/gastos/${gasto.id}` : `${API}/gastos`;
       const method = editing ? 'PUT' : 'POST';
       const body = {...form, monto:parseFloat(form.monto)};
-      if(form.empleado_id){
-        body.empleado_id = parseInt(form.empleado_id);
-      } else {
-        delete body.empleado_id;
-      }
+      if(form.empleado_id) body.empleado_id = parseInt(form.empleado_id);
       const r = await fetch(url,{method,headers:authHeaders(),body:JSON.stringify(body)});
       if(!r.ok){ const e=await r.json(); throw new Error(e.detail||'Error'); }
       onSaved();
@@ -249,7 +245,7 @@ function ModalGasto({empleados, gasto, onClose, onSaved, user}){
           h('label',null,'Empleado (opcional)'),
           h('select',{value:form.empleado_id,onChange:set('empleado_id')},
             h('option',{value:''},'— Sin asignar —'),
-            empleados.map(e=>h('option',{key:e.id,value:String(e.id)},e.nombre))
+            empleados.map(e=>h('option',{key:e.id,value:e.id},e.nombre))
           )
         ),
         h('div',{className:'field'},h('label',null,'Fecha'),h('input',{type:'date',value:form.fecha,onChange:set('fecha')})),
